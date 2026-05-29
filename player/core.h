@@ -362,6 +362,10 @@ typedef struct MPContext {
     int64_t starfish_audio_sync_last_ns;
     int64_t starfish_audio_sync_last_log_ns;
     int64_t starfish_audio_sync_start_ns;
+    int64_t starfish_audio_sync_last_realign_ns;
+    int64_t starfish_audio_clock_wait_start_ns;
+    bool starfish_audio_clock_wait_logged;
+    bool starfish_audio_sync_resync_pending;
     double starfish_audio_sync_avd_filtered;
     double starfish_audio_start_bias;
     bool starfish_video_held_for_audio;
@@ -524,6 +528,7 @@ struct mp_abort_entry {
 
 // audio.c
 void reset_audio_state(struct MPContext *mpctx);
+void mark_starfish_audio_sync_seek(struct MPContext *mpctx);
 void reinit_audio_chain(struct MPContext *mpctx);
 int init_audio_decoder(struct MPContext *mpctx, struct track *track);
 void uninit_audio_decoder(struct MPContext *mpctx);

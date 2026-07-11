@@ -3070,6 +3070,7 @@ AV_NOWARN_DEPRECATED(
     p->last_srgb_power22 = opts->treat_srgb_as_power22;
 }
 
+#if HAVE_GL && defined(PL_HAVE_OPENGL)
 struct native_resource_entry {
     const char *name;
     size_t size;
@@ -3383,6 +3384,7 @@ const struct render_backend_fns render_backend_gpu_next = {
     .perfdata = libmpv_perfdata,
     .destroy = libmpv_destroy,
 };
+#endif
 
 const struct vo_driver video_out_gpu_next = {
     .description = "Video output based on libplacebo",

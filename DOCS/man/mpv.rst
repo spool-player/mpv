@@ -393,7 +393,7 @@ Left double click
     Toggle fullscreen on/off.
 
 Right click
-    Toggle pause on/off.
+    Show the context menu (see `CONTEXT MENU`_).
 
 Forward/Back button
     Skip to next/previous entry in playlist.
@@ -1491,6 +1491,10 @@ PROTOCOLS
             mpv "archive://file.zip|video.mkv"
 
         This will play ``video.mkv`` in the archive file ``file.zip``.
+
+``env://variable``
+
+    Read the environment variable ``variable`` as source data.
 
 PSEUDO GUI MODE
 ===============

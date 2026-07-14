@@ -80,6 +80,9 @@ static const struct vo_driver *const video_out_drivers[] =
 #if HAVE_DIRECT3D
     &video_out_direct3d,
 #endif
+#if HAVE_DMABUF_WAYLAND
+    &video_out_dmabuf_wayland,
+#endif
 #if HAVE_WAYLAND && HAVE_MEMFD_CREATE
     &video_out_wlshm,
 #endif
@@ -94,9 +97,6 @@ static const struct vo_driver *const video_out_drivers[] =
 #endif
 #if HAVE_SDL2_VIDEO
     &video_out_sdl,
-#endif
-#if HAVE_DMABUF_WAYLAND
-    &video_out_dmabuf_wayland,
 #endif
 #if HAVE_VAAPI_X11 && HAVE_GPL
     &video_out_vaapi,

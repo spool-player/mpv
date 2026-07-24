@@ -861,26 +861,18 @@ void mark_starfish_audio_sync_seek(struct MPContext *mpctx)
     }
 }
 
-bool prepare_starfish_audio_resume(struct MPContext *mpctx)
+void prepare_starfish_audio_resume(struct MPContext *mpctx)
 {
     struct ao_chain *ao_c = mpctx->ao_chain;
     if (!starfish_split_clock(mpctx) || !ao_c || !ao_c->ao
         || mpctx->audio_status == STATUS_EOF)
-        return false;
+        return;
 
-    MP_VERBOSE(mpctx, "preparing coordinated ALSA and Starfish resume\n");
-    mpctx->starfish_video_held_for_audio = true;
+    MP_VERBOSE(mpctx, "preparing ALSA for live Starfish resume\n");
     ao_reset(ao_c->ao);
     reset_audio_state(mpctx);
-    if (mpctx->playback_pts != MP_NOPTS_VALUE) {
-        ao_c->start_pts = mpctx->playback_pts - mpctx->opts->audio_delay;
-        ao_c->start_pts_known = true;
-        MP_VERBOSE(mpctx, "latched Starfish resume target %f\n",
-                   ao_c->start_pts);
-    }
     mp_filter_wakeup(ao_c->ao_filter);
     mp_wakeup_core(mpctx);
-    return true;
 }
 
 static void sync_alsa_to_starfish_clock(struct MPContext *mpctx)
@@ -1027,6 +1019,10 @@ static bool get_sync_pts(struct MPContext *mpctx, double *pts, bool require_live
                 *pts = mpctx->hrseek_pts - audio_start_delay;
                 return true;
             }
+            if (split_clock && mpctx->playback_pts != MP_NOPTS_VALUE) {
+                *pts = mpctx->playback_pts - audio_start_delay;
+                return true;
+            }
             if (mpctx->video_pts != MP_NOPTS_VALUE) {
                 *pts = mpctx->video_pts - audio_start_delay;
                 return true;
@@ -1100,15 +1096,11 @@ void audio_start_ao(struct MPContext *mpctx)
     if (!ao_c || !ao_c->ao || mpctx->audio_status != STATUS_READY)
         return;
     bool split_clock = starfish_split_clock(mpctx) && mpctx->video_status != STATUS_EOF;
-    bool coordinated_start = split_clock && mpctx->starfish_video_held_for_audio
-        && ao_c->start_pts_known;
     double pts = MP_NOPTS_VALUE;
-    if (coordinated_start) {
-        pts = ao_c->start_pts;
-    } else if (split_clock) {
+    if (split_clock) {
         if (!get_sync_pts(mpctx, &pts, true)) {
             if (!mpctx->starfish_audio_clock_wait_logged) {
-                MP_VERBOSE(mpctx, "waiting for stable Starfish video clock before ALSA start\n");
+                MP_VERBOSE(mpctx, "waiting for live Starfish video clock before ALSA start\n");
                 mpctx->starfish_audio_clock_wait_logged = true;
             }
             mp_set_timeout(mpctx, MP_TIME_NS_TO_S(STARFISH_AUDIO_SYNC_PERIOD_NS));
@@ -1120,68 +1112,62 @@ void audio_start_ao(struct MPContext *mpctx)
     }
 
     double desired_pts = pts;
-    if (split_clock && !coordinated_start) {
+    if (split_clock) {
         double external_pts = MP_NOPTS_VALUE;
         if (query_external_video_clock(mpctx, &external_pts))
             desired_pts = external_pts - mpctx->opts->audio_delay;
     }
     double apts = playing_audio_pts(mpctx);
-    if (!coordinated_start) {
-        if (split_clock && !mpctx->starfish_audio_start_realign_done
-            && desired_pts != MP_NOPTS_VALUE && apts != MP_NOPTS_VALUE
-            && desired_pts > apts
-            && desired_pts - apts > STARFISH_AUDIO_START_REALIGN_THRESHOLD) {
-            realign_starfish_audio_start(mpctx, desired_pts);
+    if (split_clock && !mpctx->starfish_audio_start_realign_done
+        && desired_pts != MP_NOPTS_VALUE && apts != MP_NOPTS_VALUE
+        && desired_pts > apts
+        && desired_pts - apts > STARFISH_AUDIO_START_REALIGN_THRESHOLD) {
+        realign_starfish_audio_start(mpctx, desired_pts);
+        return;
+    }
+    if (split_clock) {
+        if (desired_pts != MP_NOPTS_VALUE && apts != MP_NOPTS_VALUE &&
+            desired_pts < apts)
+        {
+            double diff = (apts - desired_pts) / mpctx->opts->playback_speed;
+            if (!get_internal_paused(mpctx))
+                mp_set_timeout(mpctx, diff);
+            MP_TRACE(mpctx, "delaying Starfish audio start %f vs. %f, diff=%f\n",
+                     apts, desired_pts, diff);
+            ao_c->delaying_audio_start = true;
             return;
         }
-        if (split_clock) {
-            if (desired_pts != MP_NOPTS_VALUE && apts != MP_NOPTS_VALUE &&
-                desired_pts < apts)
-            {
-                double diff = (apts - desired_pts) / mpctx->opts->playback_speed;
-                if (!get_internal_paused(mpctx))
-                    mp_set_timeout(mpctx, diff);
-                MP_TRACE(mpctx, "delaying Starfish audio start %f vs. %f, diff=%f\n",
-                         apts, desired_pts, diff);
-                ao_c->delaying_audio_start = true;
+    } else if (mpctx->video_status != STATUS_EOF) {
+        double speed = mpctx->opts->playback_speed;
+        if (!ao_c->delaying_audio_start && pts != MP_NOPTS_VALUE &&
+            apts != MP_NOPTS_VALUE && pts < apts)
+        {
+            MP_VERBOSE(mpctx, "delaying audio start %f vs. %f, diff=%f\n",
+                       apts, pts, (apts - pts) / speed);
+            ao_c->delaying_audio_start = true;
+            ao_c->delayed_start_gap = apts - pts;
+            mpctx->delay += apts - pts;
+            ao_c->delayed_start_speed = 0;
+        }
+        if (ao_c->delaying_audio_start) {
+            // Start audio once the video has played the gap to it. The video
+            // pts moves in frame steps and ahead of the display, so the gap
+            // is counted down in playback time from the first check on, every
+            // interval at the speed it was played with.
+            int64_t now = mp_time_ns();
+            double passed = MP_TIME_NS_TO_S(now - ao_c->delayed_start_last);
+            ao_c->delayed_start_gap -= passed * ao_c->delayed_start_speed;
+            ao_c->delayed_start_last = now;
+            ao_c->delayed_start_speed = get_internal_paused(mpctx) ? 0 : speed;
+            if (ao_c->delayed_start_gap > 0) {
+                if (ao_c->delayed_start_speed > 0)
+                    mp_set_timeout(mpctx, ao_c->delayed_start_gap / speed);
                 return;
             }
-        } else if (mpctx->video_status != STATUS_EOF) {
-            double speed = mpctx->opts->playback_speed;
-            if (!ao_c->delaying_audio_start && pts != MP_NOPTS_VALUE &&
-                apts != MP_NOPTS_VALUE && pts < apts)
-            {
-                MP_VERBOSE(mpctx, "delaying audio start %f vs. %f, diff=%f\n",
-                           apts, pts, (apts - pts) / speed);
-                ao_c->delaying_audio_start = true;
-                ao_c->delayed_start_gap = apts - pts;
-                mpctx->delay += apts - pts;
-                ao_c->delayed_start_speed = 0;
-            }
-            if (ao_c->delaying_audio_start) {
-                // Start audio once the video has played the gap to it. The video
-                // pts moves in frame steps and ahead of the display, so the gap
-                // is counted down in playback time from the first check on, every
-                // interval at the speed it was played with.
-                int64_t now = mp_time_ns();
-                double passed = MP_TIME_NS_TO_S(now - ao_c->delayed_start_last);
-                ao_c->delayed_start_gap -= passed * ao_c->delayed_start_speed;
-                ao_c->delayed_start_last = now;
-                ao_c->delayed_start_speed = get_internal_paused(mpctx) ? 0 : speed;
-                if (ao_c->delayed_start_gap > 0) {
-                    if (ao_c->delayed_start_speed > 0)
-                        mp_set_timeout(mpctx, ao_c->delayed_start_gap / speed);
-                    return;
-                }
-            }
         }
-    } else {
-        MP_VERBOSE(mpctx,
-                   "starting coordinated Starfish audio target=%f queued=%f\n",
-                   desired_pts, apts);
     }
 
-    MP_VERBOSE(mpctx, "starting audio playback\n");
+    MP_VERBOSE(mpctx, "starting audio playback after live video clock\n");
     ao_c->delaying_audio_start = false;
     ao_start(ao_c->ao);
     mpctx->starfish_audio_clock_wait_logged = false;
@@ -1226,21 +1212,18 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
     }
 
     if (mpctx->audio_status == STATUS_SYNCING) {
-        double pts = ao_c->start_pts;
-        bool ok = ao_c->start_pts_known;
-        if (!mpctx->starfish_video_held_for_audio || !ok) {
-            ok = get_sync_pts(mpctx, &pts, false);
+        double pts;
+        bool ok = get_sync_pts(mpctx, &pts, false);
 
-            // If the AO is still playing from the previous file (due to gapless),
-            // but if video is active, this may not work if audio starts later than
-            // video, and gapless has no advantages anyway. So block doing anything
-            // until the old audio is fully played.
-            // (Buggy if AO underruns.)
-            if (mpctx->ao && ao_is_playing(mpctx->ao)
-                && mpctx->video_status != STATUS_EOF) {
-                MP_VERBOSE(mpctx, "blocked, waiting for old audio to play\n");
-                ok = false;
-            }
+        // If the AO is still playing from the previous file (due to gapless),
+        // but if video is active, this may not work if audio starts later than
+        // video, and gapless has no advantages anyway. So block doing anything
+        // until the old audio is fully played.
+        // (Buggy if AO underruns.)
+        if (mpctx->ao && ao_is_playing(mpctx->ao)
+            && mpctx->video_status != STATUS_EOF) {
+            MP_VERBOSE(mpctx, "blocked, waiting for old audio to play\n");
+            ok = false;
         }
 
         if (ao_c->start_pts_known != ok || ao_c->start_pts != pts) {

@@ -561,10 +561,8 @@ static void reposition_bitmaps(struct sd *sd, struct sub_bitmaps *res, int exten
 
     if (!opts->sub_image_position || n < 1)
         return;
-    if (opts->sub_image_position == 2) {
-        mp_image_subtitle_reposition_all(res, extend, vis, sub_pos);
+    if (opts->sub_image_position == 2)
         return;
-    }
     if (sub_pos == 100.0f)
         return;
 
@@ -714,10 +712,14 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d, int f
         }
     }
     osd_rescale_bitmaps(res, mp_rect_w(vis), mp_rect_h(vis), d, video_par);
+    struct mp_rect output_visible = { 0, 0, d.w, d.h };
+    if (opts->sub_image_position == 2) {
+        mp_image_subtitle_reposition_all(
+            res, current->extend, output_visible, sd->shared_opts->sub_pos[sd->order]);
+    }
 
     if (opts->sub_scale != 1.0) {
         if (opts->sub_image_position == 2) {
-            struct mp_rect output_visible = { d.ml, d.mt, d.w - d.mr, d.h - d.mb };
             mp_image_subtitle_scale_all(res, current->extend, opts->sub_scale, output_visible);
         } else {
             for (int n = 0; n < res->num_parts; n++) {
@@ -902,6 +904,9 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
         return true;
     }
     case SD_CTRL_UPDATE_OPTS: {
+        uint64_t flags = *(uint64_t *)arg;
+        if (flags & UPDATE_SUB_ASS_HARD)
+            return CONTROL_NA;
         // Recoloring is baked in at decode time, so the queued events have to
         // be expanded again for a color change to show without a seek. Their
         // ids change, which is what makes the VO drop its cached textures.

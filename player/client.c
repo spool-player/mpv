@@ -660,11 +660,6 @@ mpv_handle *mpv_create_weak_client(mpv_handle *ctx, const char *name)
     return create_client(ctx, name, true);
 }
 
-#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
-int mpv_initialize_opts(mpv_handle *ctx, char **options);
-#else
-static
-#endif
 int mpv_initialize_opts(mpv_handle *ctx, char **options)
 {
     lock_core(ctx);

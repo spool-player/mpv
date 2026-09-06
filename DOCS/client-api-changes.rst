@@ -34,6 +34,8 @@ API changes
 
  --- Spool fork ---
  2.7    - add MPV_RENDER_PARAM_BACKEND for selecting the render API backend.
+        - expose mpv_initialize_opts(): apply command-line overrides after
+          config parsing and before input, script and video initialization.
  --- mpv 0.42.0 ---
  2.6    - add MPV_RENDER_API_TYPE_D3D11 render API backend, along with
           MPV_RENDER_PARAM_D3D11_INIT_PARAMS and MPV_RENDER_PARAM_D3D11_FBO,

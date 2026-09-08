@@ -3592,15 +3592,6 @@ static int libmpv_start_frame(struct priv *p, mpv_render_param *params)
         return 0;
     }
 #endif
-#if defined(MP_LIBMPV_D3D11)
-    if (p->libmpv_d3d11) {
-        // The wrapper goes and its reference with it; the caller's texture and
-        // device stay, because neither was ever ours.
-        pl_tex_destroy(p->gpu, &p->libmpv_d3d11_target);
-        pl_d3d11_destroy(&p->libmpv_d3d11);
-        p->external_target = NULL;
-    }
-#endif
 #if defined(MP_LIBMPV_VULKAN)
     if (p->libmpv_vulkan) {
         mpv_vulkan_image *image =
@@ -3668,7 +3659,7 @@ static int libmpv_render(struct render_backend *ctx, mpv_render_param *params,
         pl_gpu_flush(p->gpu);
         p->external_target = NULL;
         p->frame_pending = false;
-        return ok ? 0 : MPV_ERROR_GENERIC;
+        return ok && !pl_gpu_is_failed(p->gpu) ? 0 : MPV_ERROR_GENERIC;
     }
 #endif
 #if defined(MP_LIBMPV_VULKAN)
@@ -3728,6 +3719,15 @@ static void libmpv_destroy(struct render_backend *ctx)
 
     if (p->sw)
         pl_swapchain_destroy(&p->sw);
+#if defined(MP_LIBMPV_D3D11)
+    if (p->libmpv_d3d11) {
+        // The wrapper goes and its reference with it; the caller's texture and
+        // device stay, because neither was ever ours.
+        pl_tex_destroy(p->gpu, &p->libmpv_d3d11_target);
+        pl_d3d11_destroy(&p->libmpv_d3d11);
+        p->external_target = NULL;
+    }
+#endif
 #if defined(MP_LIBMPV_VULKAN)
     if (p->libmpv_vulkan) {
         // The wrapper goes, the caller's VkImage stays: it was never ours.

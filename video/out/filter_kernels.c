@@ -186,6 +186,11 @@ void mp_compute_lut(struct filter_kernel *filter, int count, int stride,
         for (int n = 0; n < count; n++) {
             mp_compute_weights(filter, n / (double)(count - 1),
                                out_array + stride * n);
+            // The GPU uploads vector texels, including spare channels when
+            // the tap count does not fill the last texel. Never upload heap
+            // contents that can become NaNs during texture filtering.
+            for (int padding = filter->size; padding < stride; padding++)
+                out_array[stride * n + padding] = 0.0f;
         }
     }
 }

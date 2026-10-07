@@ -100,6 +100,7 @@ const struct filter_kernel *mp_find_filter_kernel(enum scaler_filter function);
 
 bool mp_init_filter(struct filter_kernel *filter, const int *sizes,
                     double scale);
+// Nonpolar rows initialize all stride channels; channels beyond size are zero.
 void mp_compute_lut(struct filter_kernel *filter, int count, int stride,
                     float *out_array);
 

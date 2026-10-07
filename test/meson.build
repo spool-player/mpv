@@ -100,7 +100,8 @@ swresample = executable('swresample', 'swresample.c', include_directories: incdi
 test('swresample', swresample)
 
 gl_video_objects = libmpv.extract_objects('video/out/gpu/ra.c',
-                                          'video/out/gpu/utils.c')
+                                          'video/out/gpu/utils.c',
+                                          'video/out/filter_kernels.c')
 gl_video = executable('gl-video', 'gl_video.c', objects: gl_video_objects,
                       dependencies: [libavutil, libplacebo], include_directories: incdir,
                       link_with: [img_utils, test_utils])

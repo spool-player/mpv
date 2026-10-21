@@ -749,14 +749,13 @@ local function add_curl_metrics(s)
         return
     end
 
-    local configured = (metrics["requests-per-stream"] or 0) > 1
-        or (metrics["range-bytes"] or 0) > 0
-    append(s, format("%s; %d requests/stream, %s ranges, %s ring",
-                     configured and "configured limits" or "mpv defaults",
-                     metrics["requests-per-stream"] or 0,
+    append(s, format("%d selected / %d maximum request lanes, %s ranges, %s ring; %.0f ms TTFB",
+                     metrics["selected-requests"] or 1,
+                     metrics["requests-per-stream"] or 1,
                      utils.format_bytes_humanized(metrics["range-bytes"] or 0),
-                     utils.format_bytes_humanized(metrics["ring-bytes"] or 0)),
-           {prefix="Curl Profile:"})
+                     utils.format_bytes_humanized(metrics["ring-bytes"] or 0),
+                     metrics["latency-ms"] or 0),
+           {prefix="Curl Policy:"})
     append(s, format("%d active / %d peak across %d / %d streams; %d of %d finished",
                      metrics["active-requests"] or 0,
                      metrics["peak-active-requests"] or 0,
@@ -765,14 +764,27 @@ local function add_curl_metrics(s)
                      metrics["finished-requests"] or 0,
                      metrics["started-requests"] or 0),
            {prefix="Curl Activity:"})
-    append(s, format("%s received; %s/s now, %s/s average, %s/s peak; %d failed; %d retries",
+    local function rate(bytes)
+        bytes = bytes or 0
+        return format("%s/s (%.1f Mbit/s)",
+                      utils.format_bytes_humanized(bytes), bytes * 8 / 1e6)
+    end
+    append(s, format("%s received; %s now, %s wall average, %s peak; %d failed; %d retries",
                      utils.format_bytes_humanized(metrics["received-bytes"] or 0),
-                     utils.format_bytes_humanized(mp.get_property_number("cache-speed", 0)),
-                     utils.format_bytes_humanized(metrics["average-received-bytes-per-second"] or 0),
-                     utils.format_bytes_humanized(metrics["peak-received-bytes-per-second"] or 0),
+                     rate(metrics["current-received-bytes-per-second"]),
+                     rate(metrics["average-received-bytes-per-second"]),
+                     rate(metrics["peak-received-bytes-per-second"]),
                      metrics["failed-requests"] or 0,
                      metrics["retry-attempts"] or 0),
-           {prefix="Curl Traffic:"})
+           {prefix="Curl Core Lifetime:"})
+    for _, lane in ipairs(metrics["lane-samples"] or {}) do
+        append(s, format("%s received; %s active average, %s now, %s peak",
+                         utils.format_bytes_humanized(lane["received-bytes"] or 0),
+                         rate(lane["average-bytes-per-second"]),
+                         rate(lane["current-bytes-per-second"]),
+                         rate(lane["peak-bytes-per-second"])),
+               {prefix=format("Curl Lane %d Lifetime:", lane.lane or 0)})
+    end
 end
 
 

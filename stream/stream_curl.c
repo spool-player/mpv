@@ -84,6 +84,14 @@ struct curl_opts {
     int64_t buffer_size;
     int64_t max_request_size;
     int parallel_requests;
+    bool adaptive;
+    int initial_requests;
+    double latency_ms;
+    int64_t observed_bps;
+    double media_bitrate;
+    int startup_requests;
+    int64_t startup_bytes;
+    double startup_buffer_seconds;
 };
 
 // Older lavf has a bug with nested IO cleanup, so don't enable curl by default.
@@ -118,6 +126,14 @@ const struct m_sub_options curl_conf = {
         {"max-request-size", OPT_BYTE_SIZE(max_request_size),
             M_RANGE(0, M_MAX_MEM_BYTES)},
         {"parallel-requests", OPT_INT(parallel_requests), M_RANGE(1, 16)},
+        {"adaptive", OPT_BOOL(adaptive)},
+        {"initial-requests", OPT_INT(initial_requests), M_RANGE(1, 16)},
+        {"latency-ms", OPT_DOUBLE(latency_ms), M_RANGE(0, 600000)},
+        {"observed-bps", OPT_BYTE_SIZE(observed_bps), M_RANGE(0, M_MAX_MEM_BYTES)},
+        {"media-bitrate", OPT_DOUBLE(media_bitrate), M_RANGE(0, 1e12)},
+        {"startup-requests", OPT_INT(startup_requests), M_RANGE(1, 16)},
+        {"startup-bytes", OPT_BYTE_SIZE(startup_bytes), M_RANGE(0, M_MAX_MEM_BYTES)},
+        {"startup-buffer-seconds", OPT_DOUBLE(startup_buffer_seconds), M_RANGE(0, 600)},
         {0}
     },
     .defaults = &(const struct curl_opts) {
@@ -131,6 +147,10 @@ const struct m_sub_options curl_conf = {
         .buffer_size = 4 << 20, // 4 MiB
         .max_request_size = 0,
         .parallel_requests = 1,
+        .adaptive = true,
+        .initial_requests = 1,
+        .startup_requests = 1,
+        .startup_buffer_seconds = 0.5,
     },
     .size = sizeof(struct curl_opts),
 };
@@ -144,6 +164,21 @@ static const struct curl_scheme *curl_scheme_lookup(bstr url)
     }
     return NULL;
 }
+
+// All rate state is owned by the curl thread. Snapshot readers use its dispatch
+// queue, so a body callback requires no locks or per-chunk atomic operations.
+#define RATE_BUCKET_NS MP_TIME_MS_TO_NS(250)
+#define RATE_BUCKETS 8
+struct curl_rate {
+    uint64_t bytes;
+    int64_t started_ns;
+    int64_t bucket_id[RATE_BUCKETS];
+    uint64_t bucket_bytes[RATE_BUCKETS];
+    int64_t peak;
+    int users;
+    int64_t active_started_ns;
+    int64_t active_ns;
+};
 
 struct curl_ctx {
     mp_thread thread;
@@ -161,12 +196,24 @@ struct curl_ctx {
     atomic_uint_fast64_t finished_requests;
     atomic_uint_fast64_t failed_requests;
     atomic_uint_fast64_t retry_attempts;
-    atomic_uint_fast64_t received_bytes;
-    atomic_int_fast64_t first_received_ns;
-    atomic_int_fast64_t last_received_ns;
-    atomic_int_fast64_t rate_window_started_ns;
-    atomic_uint_fast64_t rate_window_bytes;
-    atomic_int_fast64_t peak_received_bytes_per_second;
+    struct curl_rate traffic;
+    struct curl_rate lanes[MP_CURL_MAX_LANES];
+    int64_t lane_capacity[MP_CURL_MAX_LANES];
+    int64_t lane_samples[MP_CURL_MAX_LANES];
+    int64_t next_stream_id;
+    int64_t stream_id;
+    int selected_requests;
+    double latency_ms;
+    int64_t capacity;
+    int64_t capacity_samples;
+    struct mp_curl_concurrency_metrics concurrency[MP_CURL_MAX_LANES];
+    double media_bitrate;
+    double buffer_seconds;
+    uint64_t pause_serial;
+    bool playback_paused;
+    int64_t paused_ns;
+    int64_t pause_started_ns;
+    int64_t buffer_generation;
 };
 
 struct priv;
@@ -179,6 +226,14 @@ enum curl_handle_kind {
 struct curl_handle_ref {
     enum curl_handle_kind kind;
     struct priv *p;
+    int lane;
+    int64_t started_ns;
+    int64_t first_byte_ns;
+    uint64_t received;
+    bool blocked;
+    bool measuring;
+    uint64_t pause_serial;
+    uint64_t generation;
 };
 
 struct dynamic_request {
@@ -237,6 +292,31 @@ struct priv {
     bool dynamic_started;
     bool dynamic_supported;
     bool primary_done;
+    int selected_requests;
+    int previous_requests;
+    int rejected_requests;
+    int64_t stream_id;
+    size_t segment_size;
+    size_t range_size;
+    double latency_ms;
+    double capacity;
+    double previous_capacity;
+    uint64_t phase_bytes;
+    uint64_t phase_delivered;
+    int phase_completed;
+    bool phase_blocked;
+    int64_t last_adjustment_ns;
+    int64_t capacity_samples;
+    size_t paused_bytes;
+    uint64_t generation;
+    int transitioning;
+    int learning_active;
+    int64_t learning_updated_ns;
+    int64_t phase_active_ns;
+    bool startup;
+    uint64_t startup_start;
+    uint64_t startup_end;
+    int64_t startup_buffer_generation;
 
     // Probe state. Set on the curl thread read by curl_open after.
     bool probed;
@@ -285,6 +365,149 @@ static void pump_dynamic(struct priv *p);
 static void stop_dynamic(struct priv *p);
 static void on_dynamic_done(struct dynamic_request *request, CURLcode code);
 static void fallback_dynamic(struct priv *p);
+static void update_adaptation(struct priv *p);
+
+static int64_t rate_current(struct curl_rate *rate, int64_t now)
+{
+    int64_t bucket = now / RATE_BUCKET_NS;
+    uint64_t bytes = 0;
+    // Four complete 250ms buckets form an exact wall-clock second. Never
+    // divide a callback burst by a near-zero interval, including at startup.
+    for (int n = 0; n < RATE_BUCKETS; n++) {
+        int64_t age = bucket - rate->bucket_id[n];
+        if (age >= 1 && age <= 4)
+            bytes += rate->bucket_bytes[n];
+    }
+    if (rate->started_ns && now - rate->started_ns >= MP_TIME_S_TO_NS(1))
+        rate->peak = MPMAX(rate->peak, bytes);
+    return bytes;
+}
+
+static void rate_start(struct curl_rate *rate, int64_t now)
+{
+    if (!rate->started_ns)
+        rate->started_ns = now;
+    if (rate->users)
+        rate->active_ns += rate->users * (now - rate->active_started_ns);
+    rate->users++;
+    rate->active_started_ns = now;
+}
+
+static void rate_stop(struct curl_rate *rate, int64_t now)
+{
+    mp_assert(rate->users > 0);
+    rate->active_ns += rate->users * (now - rate->active_started_ns);
+    rate->users--;
+    rate->active_started_ns = now;
+}
+
+static void rate_add(struct curl_rate *rate, size_t bytes, int64_t now)
+{
+    rate_current(rate, now);
+    int64_t bucket = now / RATE_BUCKET_NS;
+    int index = bucket % RATE_BUCKETS;
+    if (rate->bucket_id[index] != bucket) {
+        rate->bucket_id[index] = bucket;
+        rate->bucket_bytes[index] = 0;
+    }
+    rate->bucket_bytes[index] += bytes;
+    rate->bytes += bytes;
+}
+
+static int64_t learning_time(struct curl_ctx *ctx, int64_t now)
+{
+    return now - ctx->paused_ns -
+        (ctx->playback_paused ? now - ctx->pause_started_ns : 0);
+}
+
+static void learning_tick(struct priv *p, int64_t now)
+{
+    int64_t clock = learning_time(p->ctx, now);
+    if (p->learning_updated_ns && !p->transitioning && !p->startup &&
+        p->learning_active > (p->paused ? 1 : 0))
+    {
+        p->phase_active_ns += clock - p->learning_updated_ns;
+    }
+    p->learning_updated_ns = clock;
+}
+
+static void begin_measurement(struct curl_handle_ref *ref)
+{
+    struct priv *p = ref->p;
+    int64_t now = mp_time_ns();
+    learning_tick(p, now);
+    p->learning_active++;
+    ref->started_ns = now;
+    ref->first_byte_ns = 0;
+    ref->received = 0;
+    ref->blocked = false;
+    ref->measuring = true;
+    ref->pause_serial = p->ctx->pause_serial;
+    ref->generation = p->generation;
+    rate_start(&p->ctx->traffic, now);
+    rate_start(&p->ctx->lanes[ref->lane], now);
+}
+
+static void end_measurement(struct curl_handle_ref *ref, bool succeeded)
+{
+    if (!ref->measuring)
+        return;
+    struct priv *p = ref->p;
+    struct curl_ctx *ctx = p->ctx;
+    int64_t now = mp_time_ns();
+    learning_tick(p, now);
+    p->learning_active--;
+    if (ref->generation != p->generation) {
+        mp_assert(p->transitioning > 0);
+        p->transitioning--;
+    }
+    ref->measuring = false;
+    rate_stop(&ctx->traffic, now);
+    rate_stop(&ctx->lanes[ref->lane], now);
+    // Capacity includes setup, TTFB and server stalls, but a deliberately
+    // paused request is not evidence of low server capacity.
+    if (succeeded && !ref->blocked && !ctx->playback_paused &&
+        ref->pause_serial == ctx->pause_serial &&
+        ref->generation == p->generation &&
+        ref->received && now > ref->started_ns)
+    {
+        int64_t rate = ref->received / MP_TIME_NS_TO_S(now - ref->started_ns);
+        int lane = ref->lane;
+        if (ctx->stream_id == p->stream_id) {
+            ctx->lane_capacity[lane] = ctx->lane_samples[lane]
+                ? (ctx->lane_capacity[lane] * 3 + rate) / 4 : rate;
+            ctx->lane_samples[lane]++;
+        }
+        if (ref->first_byte_ns) {
+            double latency = MP_TIME_NS_TO_S(
+                ref->first_byte_ns - ref->started_ns) * 1000;
+            p->latency_ms = p->latency_ms > 0
+                ? p->latency_ms * 0.75 + latency * 0.25 : latency;
+            if (ctx->stream_id == p->stream_id)
+                ctx->latency_ms = p->latency_ms;
+        }
+        p->phase_completed++;
+    } else {
+        p->phase_blocked = true;
+    }
+}
+
+static void record_received_bytes(struct curl_handle_ref *ref, size_t bytes)
+{
+    int64_t now = mp_time_ns();
+    if (!ref->first_byte_ns)
+        ref->first_byte_ns = now;
+    ref->received += bytes;
+    rate_add(&ref->p->ctx->traffic, bytes, now);
+    rate_add(&ref->p->ctx->lanes[ref->lane], bytes, now);
+    struct priv *p = ref->p;
+    if (!p->transitioning && !p->startup && !p->ctx->playback_paused &&
+        ref->generation == p->generation)
+    {
+        p->phase_bytes += bytes;
+    }
+}
+
 static void setup_curl(struct priv *p, CURL *curl);
 
 static CURLMcode add_curl_handle(struct curl_ctx *ctx, CURL *handle)
@@ -361,6 +584,17 @@ static void run_cmd(void *arg)
     struct curl_ctx *ctx = c->ctx;
     switch (c->kind) {
     case CMD_ADD:
+        c->p->stream_id = ++ctx->next_stream_id;
+        c->p->startup_start = c->p->request_start;
+        c->p->startup_buffer_generation = ctx->buffer_generation;
+        ctx->stream_id = c->p->stream_id;
+        ctx->selected_requests = c->p->selected_requests;
+        ctx->capacity = 0;
+        ctx->capacity_samples = 0;
+        ctx->latency_ms = c->p->latency_ms;
+        memset(ctx->concurrency, 0, sizeof(ctx->concurrency));
+        memset(ctx->lane_capacity, 0, sizeof(ctx->lane_capacity));
+        memset(ctx->lane_samples, 0, sizeof(ctx->lane_samples));
         MP_TRACE(c->p, "starting curl request at %" PRIu64 "\n", c->p->request_start);
         start_request(c->p);
         break;
@@ -369,6 +603,7 @@ static void run_cmd(void *arg)
         if (c->p->active) {
             MP_TRACE(c->p, "removing curl handle\n");
             remove_curl_handle(ctx, c->p->curl);
+            end_measurement(&c->p->primary_ref, false);
             c->p->active = false;
         }
         break;
@@ -377,6 +612,7 @@ static void run_cmd(void *arg)
         // resume the transfer.
         mp_mutex_lock(&c->p->mtx);
         MP_TRACE(c->p, "resuming curl transfer\n");
+        learning_tick(c->p, mp_time_ns());
         c->p->paused = false;
         mp_mutex_unlock(&c->p->mtx);
         curl_easy_pause(c->p->curl, CURLPAUSE_CONT);
@@ -387,6 +623,7 @@ static void run_cmd(void *arg)
         if (c->p->active) {
             remove_curl_handle(ctx, c->p->curl);
             c->p->active = false;
+            end_measurement(&c->p->primary_ref, false);
         }
         mp_mutex_lock(&c->p->mtx);
         if (c->drop)
@@ -401,6 +638,25 @@ static void run_cmd(void *arg)
         c->p->retry_count = 0;
         c->p->finished = false;
         c->p->primary_done = false;
+        c->p->paused_bytes = 0;
+        c->p->phase_bytes = 0;
+        c->p->phase_completed = 0;
+        c->p->phase_delivered = 0;
+        c->p->phase_blocked = false;
+        c->p->phase_active_ns = 0;
+        c->p->learning_updated_ns = 0;
+        c->p->previous_requests = 0;
+        c->p->rejected_requests = 0;
+        c->p->startup = c->p->opts->adaptive &&
+                         c->p->opts->max_request_size > 0;
+        c->p->startup_end = 0;
+        c->p->startup_start = c->pos;
+        c->p->startup_buffer_generation = ctx->buffer_generation;
+        c->p->selected_requests = c->p->opts->adaptive
+            ? MPMIN(c->p->opts->startup_requests,
+                    c->p->opts->parallel_requests)
+            : c->p->opts->parallel_requests;
+        c->p->generation++;
         start_request(c->p);
         break;
     case CMD_START_DYNAMIC:
@@ -489,6 +745,7 @@ static MP_THREAD_VOID curl_thread(void *arg)
                                                   memory_order_relaxed);
             }
             remove_curl_handle(ctx, msg->easy_handle);
+            end_measurement(ref, succeeded);
             finish_curl_request(ctx, succeeded);
             if (ref->kind == CURL_HANDLE_PRIMARY) {
                 ref->p->active = false;
@@ -500,7 +757,10 @@ static MP_THREAD_VOID curl_thread(void *arg)
             }
         }
 
-        curl_multi_poll(ctx->multi, NULL, 0, 1000, NULL);
+        rate_current(&ctx->traffic, mp_time_ns());
+        for (int n = 0; n < MP_CURL_MAX_LANES; n++)
+            rate_current(&ctx->lanes[n], mp_time_ns());
+        curl_multi_poll(ctx->multi, NULL, 0, 250, NULL);
     }
 
     curl_multi_cleanup(ctx->multi);
@@ -525,26 +785,20 @@ void mp_curl_global_init(struct mpv_global *global)
     mp_require(!mp_thread_create(&ctx->thread, curl_thread, ctx));
 }
 
-bool mp_curl_get_metrics(struct mpv_global *global,
-                         struct mp_curl_metrics *metrics)
+struct metrics_snapshot {
+    struct curl_ctx *ctx;
+    struct mp_curl_metrics *metrics;
+};
+
+static void read_metrics(void *arg)
 {
-    if (!global || !global->curl || !metrics)
-        return false;
-
-    struct curl_ctx *ctx = global->curl;
-    int64_t received =
-        atomic_load_explicit(&ctx->received_bytes, memory_order_relaxed);
-    int64_t first =
-        atomic_load_explicit(&ctx->first_received_ns, memory_order_relaxed);
-    int64_t last =
-        atomic_load_explicit(&ctx->last_received_ns, memory_order_relaxed);
-    int64_t average = last > first
-        ? (int64_t)((double)received / MP_TIME_NS_TO_S(last - first))
-        : 0;
-    int64_t peak = atomic_load_explicit(
-        &ctx->peak_received_bytes_per_second, memory_order_relaxed);
-    peak = MPMAX(peak, average);
-
+    struct metrics_snapshot *snapshot = arg;
+    struct curl_ctx *ctx = snapshot->ctx;
+    struct mp_curl_metrics *metrics = snapshot->metrics;
+    int64_t now = mp_time_ns();
+    double elapsed = ctx->traffic.started_ns
+        ? MP_TIME_NS_TO_S(now - ctx->traffic.started_ns) : 0;
+    int64_t current = rate_current(&ctx->traffic, now);
     *metrics = (struct mp_curl_metrics) {
         .active_requests =
             atomic_load_explicit(&ctx->active_requests, memory_order_relaxed),
@@ -571,11 +825,82 @@ bool mp_curl_get_metrics(struct mpv_global *global,
             atomic_load_explicit(&ctx->failed_requests, memory_order_relaxed),
         .retry_attempts =
             atomic_load_explicit(&ctx->retry_attempts, memory_order_relaxed),
-        .received_bytes = received,
-        .average_received_bytes_per_second = average,
-        .peak_received_bytes_per_second = peak,
+        .received_bytes = ctx->traffic.bytes,
+        .average_received_bytes_per_second =
+            elapsed > 0 ? ctx->traffic.bytes / elapsed : 0,
+        .peak_received_bytes_per_second = ctx->traffic.peak,
+        .current_received_bytes_per_second = current,
+        .elapsed_seconds = elapsed,
+        .selected_requests = ctx->selected_requests,
+        .latency_ms = ctx->latency_ms,
+        .capacity_bytes_per_second = ctx->capacity,
+        .capacity_samples = ctx->capacity_samples,
+        .stream_id = ctx->stream_id,
     };
+    for (int n = 0; n < MP_CURL_MAX_LANES; n++) {
+        struct curl_rate *lane = &ctx->lanes[n];
+        double active = MP_TIME_NS_TO_S(lane->active_ns +
+            lane->users * (now - lane->active_started_ns));
+        int64_t lane_current = rate_current(lane, now);
+        metrics->lanes[n] = (struct mp_curl_lane_metrics) {
+            .received_bytes = lane->bytes,
+            .active_seconds = active,
+            .average_bytes_per_second = active > 0 ? lane->bytes / active : 0,
+            .current_bytes_per_second = lane_current,
+            .peak_bytes_per_second = lane->peak,
+            .capacity_bytes_per_second = ctx->lane_capacity[n],
+            .samples = ctx->lane_samples[n],
+        };
+        metrics->concurrency[n] = ctx->concurrency[n];
+    }
+}
+
+bool mp_curl_get_metrics(struct mpv_global *global,
+                         struct mp_curl_metrics *metrics)
+{
+    if (!global || !global->curl || !metrics)
+        return false;
+    struct metrics_snapshot snapshot = {global->curl, metrics};
+    mp_dispatch_run(global->curl->dispatch, read_metrics, &snapshot);
     return true;
+}
+
+struct curl_control {
+    struct curl_ctx *ctx;
+    double media_bitrate;
+    double buffer_seconds;
+    bool paused;
+    int64_t buffer_generation;
+};
+
+static void set_control(void *arg)
+{
+    struct curl_control *control = arg;
+    control->ctx->buffer_generation = control->buffer_generation;
+    if (control->ctx->playback_paused != control->paused) {
+        int64_t now = mp_time_ns();
+        if (control->paused) {
+            control->ctx->pause_started_ns = now;
+        } else {
+            control->ctx->paused_ns += now - control->ctx->pause_started_ns;
+        }
+        control->ctx->pause_serial++;
+    }
+    control->ctx->media_bitrate = control->media_bitrate;
+    control->ctx->buffer_seconds = control->buffer_seconds;
+    control->ctx->playback_paused = control->paused;
+}
+
+void mp_curl_set_control(struct mpv_global *global, double media_bitrate,
+                         double buffer_seconds, bool paused,
+                         int64_t buffer_generation)
+{
+    if (!global || !global->curl)
+        return;
+    struct curl_control control = {
+        global->curl, media_bitrate, buffer_seconds, paused, buffer_generation,
+    };
+    mp_dispatch_run(global->curl->dispatch, set_control, &control);
 }
 
 // Curl callbacks
@@ -597,45 +922,6 @@ static void ring_write(void *ctx, const char *data, size_t len)
     p->count += len;
 }
 
-static void record_received_bytes(struct curl_ctx *ctx, size_t bytes)
-{
-    int64_t now = mp_time_ns();
-    int_fast64_t first = 0;
-    atomic_compare_exchange_strong_explicit(
-        &ctx->first_received_ns, &first, now, memory_order_relaxed,
-        memory_order_relaxed);
-    atomic_store_explicit(&ctx->last_received_ns, now, memory_order_relaxed);
-    atomic_fetch_add_explicit(&ctx->received_bytes, bytes,
-                              memory_order_relaxed);
-
-    int_fast64_t started =
-        atomic_load_explicit(&ctx->rate_window_started_ns,
-                             memory_order_relaxed);
-    if (started == 0) {
-        atomic_store_explicit(&ctx->rate_window_started_ns, now,
-                              memory_order_relaxed);
-        started = now;
-    }
-    atomic_fetch_add_explicit(&ctx->rate_window_bytes, bytes,
-                              memory_order_relaxed);
-
-    const int64_t elapsed = now - started;
-    if (elapsed < MP_TIME_MS_TO_NS(500))
-        return;
-    atomic_store_explicit(&ctx->rate_window_started_ns, now,
-                          memory_order_relaxed);
-    const uint64_t window_bytes = atomic_exchange_explicit(
-        &ctx->rate_window_bytes, 0, memory_order_relaxed);
-    const int64_t bytes_per_second =
-        (int64_t)((double)window_bytes / MP_TIME_NS_TO_S(elapsed));
-    int_fast64_t peak = atomic_load_explicit(
-        &ctx->peak_received_bytes_per_second, memory_order_relaxed);
-    while (bytes_per_second > peak &&
-           !atomic_compare_exchange_weak_explicit(
-               &ctx->peak_received_bytes_per_second, &peak, bytes_per_second,
-               memory_order_relaxed, memory_order_relaxed))
-    {}
-}
 
 // Called per chunk of body data.
 static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata)
@@ -649,12 +935,20 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
 
     if (atomic_load_explicit(&p->aborted, memory_order_relaxed))
         return CURL_WRITEFUNC_ERROR;
+    // libcurl replays a paused body callback. Account the fresh download at
+    // first arrival (including a chunk that cannot enter the ring yet), never
+    // the replay or the later ordered-buffer memcpy.
+    if (!p->paused_bytes)
+        record_received_bytes(&p->primary_ref, bytes);
 
     mp_mutex_lock(&p->mtx);
 
     if (p->buffer_size - p->count < bytes) {
         // No room in the buffer. Pause the transfer and wait for the consumer.
+        learning_tick(p, mp_time_ns());
         p->paused = true;
+        p->paused_bytes = bytes;
+        p->primary_ref.blocked = true;
         mp_mutex_unlock(&p->mtx);
         MP_TRACE(p, "pausing curl transfer, buffer full (%zu bytes)\n", p->count);
         return CURL_WRITEFUNC_PAUSE;
@@ -664,7 +958,9 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
 
     p->paused = false;
     p->request_received += bytes;
-    record_received_bytes(p->ctx, bytes);
+    if (!p->startup && p->primary_ref.generation == p->generation)
+        p->phase_delivered += bytes;
+    p->paused_bytes = 0;
 
     mp_cond_broadcast(&p->cond);
     mp_mutex_unlock(&p->mtx);
@@ -727,8 +1023,7 @@ static size_t dynamic_write_callback(char *ptr, size_t size, size_t nmemb,
 
     memcpy(request->data + request->size, ptr, bytes);
     request->size += bytes;
-    atomic_fetch_add_explicit(&p->ctx->received_bytes, bytes,
-                              memory_order_relaxed);
+    record_received_bytes(&request->ref, bytes);
     return bytes;
 }
 
@@ -894,8 +1189,8 @@ static void probe_http(struct priv *p, struct bstr line)
     }
     p->stream_ok = true;
     p->response_ok = true;
-    schedule_dynamic = exact_range && range_start == p->request_start &&
-                       p->opts->parallel_requests > 1 &&
+    schedule_dynamic = p->seekable && exact_range &&
+                       range_start == p->request_start &&
                        p->opts->max_request_size > 0;
     p->dynamic_supported = schedule_dynamic;
 done:
@@ -1051,6 +1346,16 @@ static void start_request(struct priv *p)
         uint64_t end = UINT64_MAX;
         if (chunked) {
             uint64_t bytes = p->opts->max_request_size;
+            if (!p->probed && p->opts->adaptive) {
+                // A tiny unknown-demand probe is useful locally, but an
+                // extra small request taxes high-latency origins needlessly.
+                uint64_t demand = p->opts->startup_bytes > 0
+                    ? p->opts->startup_bytes
+                    : p->latency_ms >= 100 ? p->range_size : 64 * 1024;
+                uint64_t leading = p->latency_ms >= 100 || demand > 64 * 1024
+                    ? MPMIN(p->range_size, demand) : 64 * 1024;
+                bytes = MPMIN(bytes, leading);
+            }
             end = bytes - 1 > UINT64_MAX - start
                 ? UINT64_MAX : start + bytes - 1;
         }
@@ -1073,6 +1378,7 @@ static void start_request(struct priv *p)
     p->response_ok = false;
 
     p->request_received = 0;
+    p->paused_bytes = 0;
     CURLMcode result = add_curl_handle(p->ctx, p->curl);
     if (result != CURLM_OK) {
         MP_ERR(p, "could not start curl request: %s\n",
@@ -1084,6 +1390,7 @@ static void start_request(struct priv *p)
         mp_mutex_unlock(&p->mtx);
         return;
     }
+    begin_measurement(&p->primary_ref);
     p->active = true;
     if (p->probed && p->dynamic_supported)
         start_dynamic(p);
@@ -1097,6 +1404,109 @@ static uint64_t dynamic_limit(const struct priv *p)
     return limit;
 }
 
+static void reset_phase(struct priv *p, int64_t now)
+{
+    p->phase_bytes = 0;
+    p->phase_delivered = 0;
+    p->phase_completed = 0;
+    p->phase_blocked = false;
+    p->phase_active_ns = 0;
+    p->learning_updated_ns = learning_time(p->ctx, now);
+}
+
+static void update_adaptation(struct priv *p)
+{
+    struct curl_ctx *ctx = p->ctx;
+    int64_t now = mp_time_ns();
+    learning_tick(p, now);
+    if (p->startup || p->transitioning || ctx->playback_paused)
+        return;
+    if (p->phase_blocked) {
+        reset_phase(p, now);
+        return;
+    }
+    double seconds = MP_TIME_NS_TO_S(p->phase_active_ns);
+    if (seconds < 1.5 || p->phase_completed < p->selected_requests * 2)
+        return;
+
+    double capacity = p->phase_bytes / seconds;
+    int selected = p->selected_requests;
+    if (ctx->stream_id == p->stream_id) {
+        struct mp_curl_concurrency_metrics *point = &ctx->concurrency[selected - 1];
+        point->capacity_bytes_per_second = point->samples
+            ? (point->capacity_bytes_per_second * 3 + capacity) / 4 : capacity;
+        point->latency_ms = p->latency_ms;
+        point->samples++;
+        ctx->capacity = point->capacity_bytes_per_second;
+        ctx->capacity_samples = ++p->capacity_samples;
+        ctx->latency_ms = p->latency_ms;
+    }
+    p->capacity = capacity;
+
+    if (p->opts->adaptive) {
+        double bitrate = ctx->media_bitrate > 0
+            ? ctx->media_bitrate : p->opts->media_bitrate;
+        double target = bitrate * 1.75 / 8;
+        bool settled = now - p->last_adjustment_ns >= MP_TIME_S_TO_NS(3);
+        if (now - p->last_adjustment_ns >= MP_TIME_S_TO_NS(30))
+            p->rejected_requests = 0;
+        if (p->previous_requests) {
+            bool increased = selected > p->previous_requests;
+            bool useful = increased
+                ? (capacity > p->previous_capacity * 1.12 ||
+                   (target > 0 && capacity >= target)) &&
+                  p->phase_delivered >= p->phase_bytes / 2
+                : capacity >= target && target > 0;
+            if (!useful) {
+                if (increased)
+                    p->rejected_requests = selected;
+                selected = p->previous_requests;
+            }
+            p->previous_requests = 0;
+            p->last_adjustment_ns = now;
+        } else if (settled && target > 0 && capacity < target &&
+                   selected < p->opts->parallel_requests &&
+                   selected + 1 != p->rejected_requests)
+        {
+            p->previous_requests = selected;
+            p->previous_capacity = capacity;
+            selected++;
+            p->last_adjustment_ns = now;
+        } else if (target > 0 && selected > 1 && capacity >= target &&
+                   ctx->buffer_seconds >= 3 &&
+                   now - p->last_adjustment_ns >= MP_TIME_S_TO_NS(15))
+        {
+            p->previous_requests = selected;
+            p->previous_capacity = capacity;
+            selected--;
+            p->last_adjustment_ns = now;
+        }
+        if (selected != p->selected_requests) {
+            MP_VERBOSE(p, "adaptive request lanes: %d -> %d\n",
+                       p->selected_requests, selected);
+            p->selected_requests = selected;
+            p->generation++;
+            p->transitioning = p->learning_active;
+        }
+        // Amortize observed first-byte latency without making the ordered
+        // leading range huge. A fixed preallocated segment ceiling bounds it.
+        double wanted = capacity / selected *
+            MPMAX(0.25, p->latency_ms / 1000 * 2);
+        size_t range = MPCLAMP(wanted, MPMIN(256 * 1024, p->segment_size),
+                              p->segment_size);
+        if (!p->previous_requests && selected == p->selected_requests &&
+            (range < p->range_size * 3 / 4 || range > p->range_size * 5 / 4))
+        {
+            p->range_size = range;
+            p->generation++;
+            p->transitioning = p->learning_active;
+        }
+    }
+    if (ctx->stream_id == p->stream_id)
+        ctx->selected_requests = p->selected_requests;
+    reset_phase(p, now);
+}
+
 static bool schedule_dynamic_request(struct dynamic_request *request)
 {
     struct priv *p = request->ref.p;
@@ -1104,7 +1514,15 @@ static bool schedule_dynamic_request(struct dynamic_request *request)
     if (request->scheduled || p->next_schedule >= limit)
         return false;
 
-    uint64_t bytes = p->opts->max_request_size;
+    uint64_t bytes = p->range_size;
+    if (p->startup) {
+        if (p->next_schedule >= p->startup_end)
+            return false;
+        bytes = MPMIN(bytes, p->startup_end - p->next_schedule);
+        uint64_t remaining = p->startup_end - p->request_start;
+        bytes = MPMIN(bytes, MPMAX(64 * 1024,
+                         remaining / p->selected_requests));
+    }
     uint64_t end = p->next_schedule +
                    MPMIN(bytes, limit - p->next_schedule);
     request->start = p->next_schedule;
@@ -1129,10 +1547,69 @@ static bool schedule_dynamic_request(struct dynamic_request *request)
         cmd_async(p, CMD_FALLBACK_DYNAMIC);
         return false;
     }
+    begin_measurement(&request->ref);
     request->active = true;
     MP_TRACE(p, "prefetching range %" PRIu64 "-%" PRIu64 "\n",
              request->start, request->end - 1);
     return true;
+}
+
+static void fill_dynamic(struct priv *p)
+{
+    if (p->startup) {
+        int64_t now = mp_time_ns();
+        if (!p->startup_end) {
+            double bitrate = p->ctx->media_bitrate > 0
+                ? p->ctx->media_bitrate : p->opts->media_bitrate;
+            double remaining_seconds = MPMAX(0,
+                p->opts->startup_buffer_seconds - p->ctx->buffer_seconds);
+            uint64_t demand = p->opts->startup_bytes > 0
+                ? p->opts->startup_bytes
+                : MPMAX(128 * 1024, bitrate / 8 * remaining_seconds);
+            p->startup_end = p->startup_start +
+                MPMIN(demand, UINT64_MAX - p->startup_start);
+        }
+        bool buffered = p->ctx->buffer_generation > p->startup_buffer_generation &&
+            p->opts->startup_buffer_seconds > 0 &&
+            p->ctx->buffer_seconds >= p->opts->startup_buffer_seconds;
+        if (p->request_start >= p->startup_end || buffered) {
+            learning_tick(p, now);
+            p->startup = false;
+            int steady = MPMIN(p->opts->initial_requests,
+                              p->opts->parallel_requests);
+            p->selected_requests = steady;
+            p->generation++;
+            p->transitioning = p->learning_active;
+            if (p->ctx->stream_id == p->stream_id)
+                p->ctx->selected_requests = steady;
+            reset_phase(p, now);
+        }
+    }
+    update_adaptation(p);
+    // Drain a configuration generation before beginning the next trial.
+    // Otherwise a new request can contribute only half its time/body.
+    if (p->transitioning)
+        return;
+    int scheduled = p->active;
+    for (int n = 0; n < p->num_requests; n++) {
+        struct dynamic_request *request = &p->requests[n];
+        if (request->scheduled && request->ref.generation != p->generation)
+            return;
+        scheduled += request->scheduled;
+    }
+    mp_mutex_lock(&p->mtx);
+    bool space = p->count < p->buffer_size * 3 / 4;
+    if (!space)
+        p->dynamic_waiting = true;
+    mp_mutex_unlock(&p->mtx);
+    if (!space)
+        return;
+    for (int n = 0; n < p->num_requests && scheduled < p->selected_requests; n++) {
+        if (p->active && n == 0)
+            continue;
+        if (schedule_dynamic_request(&p->requests[n]))
+            scheduled++;
+    }
 }
 
 static void stop_dynamic(struct priv *p)
@@ -1141,6 +1618,7 @@ static void stop_dynamic(struct priv *p)
         struct dynamic_request *request = &p->requests[n];
         if (request->active) {
             remove_curl_handle(p->ctx, request->curl);
+            end_measurement(&request->ref, false);
             request->active = false;
         }
         if (request->curl)
@@ -1159,13 +1637,15 @@ static void stop_dynamic(struct priv *p)
 
 static void start_dynamic(struct priv *p)
 {
-    uint64_t segment_size = p->opts->max_request_size;
+    uint64_t segment_size = p->segment_size;
     int count = p->opts->parallel_requests;
     if (p->dynamic_started || !p->dynamic_supported ||
         p->content_size <= 0 || p->primary_end < p->request_start)
     {
         return;
     }
+    if (p->primary_end >= dynamic_limit(p))
+        return;
     if (segment_size > SIZE_MAX ||
         (size_t)count > SIZE_MAX / (size_t)segment_size)
     {
@@ -1197,6 +1677,7 @@ static void start_dynamic(struct priv *p)
         struct dynamic_request *request = &p->requests[n];
         request->ref.kind = CURL_HANDLE_DYNAMIC;
         request->ref.p = p;
+        request->ref.lane = n;
         request->curl = curl_easy_init();
         request->data = p->request_data + n * segment_bytes;
         if (!request->curl) {
@@ -1219,9 +1700,7 @@ static void start_dynamic(struct priv *p)
         curl_easy_setopt(request->curl, CURLOPT_XFERINFODATA, request);
     }
 
-    int initial = p->active ? count - 1 : count;
-    for (int n = 0; n < initial; n++)
-        schedule_dynamic_request(&p->requests[n]);
+    fill_dynamic(p);
 
     MP_VERBOSE(p, "parallel ranged streaming enabled: %d requests, "
                   "%" PRIu64 " byte ranges\n",
@@ -1261,10 +1740,13 @@ static void pump_dynamic(struct priv *p)
             p->count += copy;
             next->consumed += copy;
             p->request_start += copy;
+            if (!p->startup && next->ref.generation == p->generation)
+                p->phase_delivered += copy;
             mp_cond_broadcast(&p->cond);
         }
-        if (copy == 0)
+        if (copy == 0) {
             p->dynamic_waiting = true;
+        }
         mp_mutex_unlock(&p->mtx);
 
         if (copy == 0)
@@ -1274,8 +1756,9 @@ static void pump_dynamic(struct priv *p)
 
         next->scheduled = false;
         next->ready = false;
-        schedule_dynamic_request(next);
+        fill_dynamic(p);
     }
+    fill_dynamic(p);
 
     if (p->request_start >= dynamic_limit(p)) {
         p->finished = true;
@@ -1296,6 +1779,12 @@ static void fallback_dynamic(struct priv *p)
         !atomic_load_explicit(&p->aborted, memory_order_relaxed);
     stop_dynamic(p);
     p->dynamic_supported = false;
+    p->selected_requests = 1;
+    p->previous_requests = 0;
+    if (p->ctx->stream_id == p->stream_id) {
+        p->ctx->selected_requests = 1;
+        p->ctx->capacity = 0;
+    }
     if (resume_primary)
         start_request(p);
 }
@@ -1331,6 +1820,11 @@ static void on_dynamic_done(struct dynamic_request *request, CURLcode code)
                 reason, request->retry_count);
         CURLMcode result = add_curl_handle(p->ctx, request->curl);
         if (result == CURLM_OK) {
+            uint64_t generation = request->ref.generation;
+            if (generation != p->generation)
+                p->transitioning++;
+            begin_measurement(&request->ref);
+            request->ref.generation = generation;
             request->active = true;
             return;
         }
@@ -1389,10 +1883,7 @@ static void on_done(struct priv *p, CURLcode code)
                     cmd_async(p, CMD_FALLBACK_DYNAMIC);
                     return;
                 }
-                for (int n = 0; n < p->num_requests; n++) {
-                    if (!p->requests[n].scheduled)
-                        schedule_dynamic_request(&p->requests[n]);
-                }
+                fill_dynamic(p);
                 pump_dynamic(p);
                 return;
             }
@@ -1430,7 +1921,12 @@ static void on_done(struct priv *p, CURLcode code)
             ? "HTTP response rejected" : curl_easy_strerror(code);
         MP_WARN(p, "%s, retrying (#%d) from %" PRIu64 "\n",
                 reason, p->retry_count, p->request_start);
+        uint64_t generation = p->primary_ref.generation;
         start_request(p);
+        if (p->active && generation != p->generation) {
+            p->primary_ref.generation = generation;
+            p->transitioning++;
+        }
         return;
     }
 
@@ -1487,7 +1983,8 @@ static void setup_curl(struct priv *p, CURL *c)
     curl_easy_setopt(c, CURLOPT_DEBUGFUNCTION, debug_callback);
     curl_easy_setopt(c, CURLOPT_DEBUGDATA, p);
 
-    bool identity = p->start_offset > 0 || p->request_end > 0;
+    bool identity = p->start_offset > 0 || p->request_end > 0 ||
+                    p->opts->max_request_size > 0;
     curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, identity ? "identity" : "");
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_MAXREDIRS, (long)p->opts->max_redirects);
@@ -1674,6 +2171,22 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     mp_assert(p->scheme);
     p->content_size = -1;
     p->buffer_size = p->opts->buffer_size;
+    p->selected_requests = p->opts->adaptive
+        ? MPMIN(p->opts->startup_requests, p->opts->parallel_requests)
+        : p->opts->parallel_requests;
+    p->startup = p->opts->adaptive && p->opts->max_request_size > 0;
+    p->latency_ms = p->opts->latency_ms;
+    p->capacity = p->opts->observed_bps;
+    // Speculative memory is one ring, not max-request-size times the cap.
+    p->segment_size = MPMIN(p->opts->max_request_size,
+                           p->buffer_size / p->opts->parallel_requests);
+    p->range_size = p->segment_size;
+    if (p->opts->adaptive && p->capacity > 0 && p->latency_ms > 0) {
+        double wanted = p->capacity / p->selected_requests *
+            MPMAX(0.25, p->latency_ms / 1000 * 2);
+        p->range_size = MPCLAMP(wanted, MPMIN(256 * 1024, p->segment_size),
+                               p->segment_size);
+    }
     p->buffer = talloc_size(p, p->buffer_size);
     p->icy = mp_icy_new(p);
 

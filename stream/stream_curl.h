@@ -30,6 +30,24 @@ struct demuxer;
 // Initialize libcurl state, must be called before stream_curl is used.
 void mp_curl_global_init(struct mpv_global *global);
 
+#define MP_CURL_MAX_LANES 16
+
+struct mp_curl_lane_metrics {
+    int64_t received_bytes;
+    double active_seconds;
+    int64_t average_bytes_per_second;
+    int64_t current_bytes_per_second;
+    int64_t peak_bytes_per_second;
+    int64_t capacity_bytes_per_second;
+    int64_t samples;
+};
+struct mp_curl_concurrency_metrics {
+    int64_t capacity_bytes_per_second;
+    double latency_ms;
+    int64_t samples;
+};
+
+
 struct mp_curl_metrics {
     int64_t active_requests;
     int64_t peak_active_requests;
@@ -45,12 +63,27 @@ struct mp_curl_metrics {
     int64_t received_bytes;
     int64_t average_received_bytes_per_second;
     int64_t peak_received_bytes_per_second;
+    int64_t current_received_bytes_per_second;
+    double elapsed_seconds;
+    int64_t selected_requests;
+    double latency_ms;
+    int64_t capacity_bytes_per_second;
+    int64_t capacity_samples;
+    int64_t stream_id;
+    struct mp_curl_lane_metrics lanes[MP_CURL_MAX_LANES];
+    struct mp_curl_concurrency_metrics concurrency[MP_CURL_MAX_LANES];
 };
 
-// Read a lock-free snapshot of the process-wide libcurl transport counters.
+// Read a curl-thread snapshot of counters retained for this mpv core's lifetime.
+// Logical lanes are concurrent request slots, not operating system threads.
 // Returns false until the curl backend has been initialized.
 bool mp_curl_get_metrics(struct mpv_global *global,
                          struct mp_curl_metrics *metrics);
+
+// Playback feedback is independent of the lifetime accounting. Bitrate is bits/s.
+void mp_curl_set_control(struct mpv_global *global, double media_bitrate,
+                         double buffer_seconds, bool paused,
+                         int64_t buffer_generation);
 
 // Open `url` via mpv's libcurl backend and wrap it as a fresh AVIOContext.
 // On success returns 0, fills *pb_out with the new context, and sets *data to

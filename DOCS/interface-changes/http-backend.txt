@@ -1,1 +1,3 @@
 add libcurl-based stream backend (http, https, ftp, ftps), with new options `--curl-enabled`, `--curl-http-version`, `--curl-max-redirects`, `--curl-max-retries`, `--curl-connect-timeout`, `--curl-buffer-size`, `--curl-max-request-size` and `--curl-parallel-requests`
+add bounded adaptive HTTP range scheduling with `--curl-adaptive`, `--curl-initial-requests`, `--curl-startup-requests`, `--curl-startup-bytes`, `--curl-startup-buffer-seconds`, `--curl-latency-ms`, `--curl-observed-bps` and `--curl-media-bitrate`
+add `curl-transport-metrics` (core-lifetime traffic, logical lanes and measured concurrency points) and writable `curl-transport-control` playback feedback

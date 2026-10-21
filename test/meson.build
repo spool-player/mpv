@@ -189,6 +189,11 @@ if get_option('libmpv')
         exe = executable('libmpv-lifetime', sources: 'libmpv_lifetime.c',
                          include_directories: incdir_public)
         test('libmpv-lifetime', exe, depends: mpvlib, suite: 'libmpv')
+        if features['libcurl']
+            test('curl-transport', python,
+                 args: [files('curl_transport.py'), '--libmpv', mpvlib.full_path()],
+                 depends: mpvlib, suite: 'libmpv', timeout: 180)
+        endif
     endif
 endif
 

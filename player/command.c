@@ -1716,6 +1716,90 @@ static int mp_property_curl_transport_metrics(void *ctx,
                        metrics.average_received_bytes_per_second);
     node_map_add_int64(result, "peak-received-bytes-per-second",
                        metrics.peak_received_bytes_per_second);
+    node_map_add_int64(result, "current-received-bytes-per-second",
+                       metrics.current_received_bytes_per_second);
+    node_map_add_double(result, "elapsed-seconds", metrics.elapsed_seconds);
+    node_map_add_int64(result, "selected-requests", metrics.selected_requests);
+    node_map_add_double(result, "latency-ms", metrics.latency_ms);
+    node_map_add_int64(result, "capacity-bytes-per-second",
+                       metrics.capacity_bytes_per_second);
+    node_map_add_int64(result, "capacity-samples", metrics.capacity_samples);
+    node_map_add_int64(result, "stream-id", metrics.stream_id);
+    struct mpv_node *lanes = node_map_add(result, "lane-samples",
+                                         MPV_FORMAT_NODE_ARRAY);
+    struct mpv_node *points = node_map_add(result, "concurrency-samples",
+                                          MPV_FORMAT_NODE_ARRAY);
+    for (int n = 0; n < MP_CURL_MAX_LANES; n++) {
+        struct mp_curl_lane_metrics *lane = &metrics.lanes[n];
+        if (lane->received_bytes) {
+            struct mpv_node *entry = node_array_add(lanes, MPV_FORMAT_NODE_MAP);
+            node_map_add_int64(entry, "lane", n);
+            node_map_add_int64(entry, "received-bytes", lane->received_bytes);
+            node_map_add_double(entry, "active-seconds", lane->active_seconds);
+            node_map_add_int64(entry, "average-bytes-per-second",
+                               lane->average_bytes_per_second);
+            node_map_add_int64(entry, "current-bytes-per-second",
+                               lane->current_bytes_per_second);
+            node_map_add_int64(entry, "peak-bytes-per-second",
+                               lane->peak_bytes_per_second);
+            node_map_add_int64(entry, "capacity-bytes-per-second",
+                               lane->capacity_bytes_per_second);
+            node_map_add_int64(entry, "samples", lane->samples);
+        }
+        struct mp_curl_concurrency_metrics *point = &metrics.concurrency[n];
+        if (point->samples) {
+            struct mpv_node *entry = node_array_add(points, MPV_FORMAT_NODE_MAP);
+            node_map_add_int64(entry, "requests", n + 1);
+            node_map_add_int64(entry, "capacity-bytes-per-second",
+                               point->capacity_bytes_per_second);
+            node_map_add_double(entry, "latency-ms", point->latency_ms);
+            node_map_add_int64(entry, "samples", point->samples);
+        }
+    }
+    return M_PROPERTY_OK;
+}
+
+static bool curl_control_number(struct mpv_node *map, const char *key,
+                                 double *number)
+{
+    struct mpv_node *node = node_map_get(map, key);
+    if (!node)
+        return false;
+    if (node->format == MPV_FORMAT_DOUBLE) {
+        *number = node->u.double_;
+    } else if (node->format == MPV_FORMAT_INT64) {
+        *number = node->u.int64;
+    } else {
+        return false;
+    }
+    return isfinite(*number) && *number >= 0;
+}
+
+static int mp_property_curl_transport_control(void *ctx,
+                                             struct m_property *prop,
+                                             int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    if (action == M_PROPERTY_GET_TYPE) {
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
+        return M_PROPERTY_OK;
+    }
+    if (action != M_PROPERTY_SET)
+        return M_PROPERTY_NOT_IMPLEMENTED;
+    struct mpv_node *map = arg;
+    double bitrate, buffer;
+    struct mpv_node *paused = node_map_get(map, "paused");
+    struct mpv_node *generation = node_map_get(map, "buffer-generation");
+    if (!curl_control_number(map, "media-bitrate", &bitrate) ||
+        !curl_control_number(map, "buffer-seconds", &buffer) ||
+        !paused || paused->format != MPV_FORMAT_FLAG ||
+        (generation && (generation->format != MPV_FORMAT_INT64 ||
+                        generation->u.int64 < 0)))
+    {
+        return M_PROPERTY_ERROR;
+    }
+    mp_curl_set_control(mpctx->global, bitrate, buffer, paused->u.flag,
+                        generation ? generation->u.int64 : 0);
     return M_PROPERTY_OK;
 }
 #endif
@@ -4761,6 +4845,7 @@ static const struct m_property mp_properties_base[] = {
     {"demuxer-cache-state", mp_property_demuxer_cache_state},
 #if HAVE_LIBCURL
     {"curl-transport-metrics", mp_property_curl_transport_metrics},
+    {"curl-transport-control", mp_property_curl_transport_control},
 #endif
     {"cache-buffering-state", mp_property_cache_buffering},
     {"paused-for-cache", mp_property_paused_for_cache},

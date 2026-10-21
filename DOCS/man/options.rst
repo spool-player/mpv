@@ -5923,10 +5923,10 @@ more robust and compatible with a wide range of servers and CDNs, and faster too
 For HTTP transfers, the backend transparently negotiates HTTP/1.1, HTTP/2
 multiplexing or HTTP/3 (QUIC) when the server offers them, with HSTS enabled
 and TCP keep-alive turned on. Content compression (gzip, deflate, zstd,
-brotli) is always advertised in the request. If the server applies it, the
-transfer is treated as non-seekable. Servers normally do not compress
-already-compressed media payloads. Otherwise, it's great improvement for text
-playlist data transfers.
+brotli) is advertised for unbounded requests. Explicit ranged transfers request
+the identity encoding, since compressed offsets cannot be translated to media
+offsets. If the server nevertheless compresses a response, the stream is treated
+as non-seekable.
 
 The backend honors the network options listed above (``--user-agent``,
 ``--http-proxy``, ``--http-header-fields``, ``--referrer``, ``--cookies*``,
@@ -5980,15 +5980,78 @@ TLS/connection diagnostics), set ``--msg-level=curl=trace``.
     non-seekable streams.
 
 ``--curl-parallel-requests=<1-16>``
-    Download consecutive byte ranges concurrently and deliver them to the
-    demuxer in order (default: 1, i.e. disabled). This can increase throughput
-    when a server or network path limits each connection.
+    Maximum concurrent logical request lanes per stream (default: 1, no
+    concurrency). Lanes are curl multi requests, not operating-system threads
+    or necessarily separate connections: HTTP/2 and HTTP/3 may multiplex them.
+    Consecutive ranges are delivered to the demuxer in byte order.
 
-    Parallel requests require HTTP, a known content length, byte-range support,
-    and a non-zero ``--curl-max-request-size``. If a parallel response is
-    invalid or fails permanently, mpv discards the speculative ranges and
-    transparently continues with one request. Each request can buffer up to
-    ``--curl-max-request-size`` bytes, in addition to ``--curl-buffer-size``.
+    Ranged scheduling requires HTTP, a known content length, byte-range support,
+    and a non-zero ``--curl-max-request-size``. Failed ranges are retried before
+    falling back to one primary request. Wrong or ignored ranges are never
+    appended to the media stream.
+
+    Speculative segment storage is bounded by one additional
+    ``--curl-buffer-size`` allocation, not request count times the configured
+    maximum range size. Each segment is capped by both
+    ``--curl-max-request-size`` and ring size divided by the maximum lane count.
+    This excludes libcurl's own protocol/TLS buffers.
+
+``--curl-adaptive=<yes|no>``
+    Adjust ranged concurrency at request boundaries (default: yes), within
+    ``--curl-parallel-requests``. With ``no``, use the configured maximum.
+    With ``yes``, aim for the smallest measured budget providing approximately
+    1.75 times the supplied delivered-media bitrate. Increase one lane at a time;
+    revert trials with negligible improvement, negative scaling, or poor ordered
+    progress. Try smaller budgets when playback has buffer reserve. In-flight
+    ranges drain in order instead of being cancelled on a budget change.
+
+    Capacity learning includes connection setup, time to first byte and server
+    stalls. It accumulates active network time across cached/full-ring idle
+    periods, without interpreting intentional backpressure or user pause as
+    deficient server capacity. Startup, failed requests and mixed configuration
+    generations are not steady-state capacity samples. These are bounded
+    heuristics, not a guarantee of maximum speed or uninterrupted playback.
+
+``--curl-initial-requests=<1-16>``
+    Learned steady-state lane seed (default: 1), capped by the maximum. Used
+    after the startup-demand phase; ignored with ``--curl-adaptive=no``.
+
+``--curl-startup-requests=<1-16>``
+    Startup lane seed (default: 1), capped by the maximum. An embedding player
+    can choose a startup budget separately from steady-state demand using
+    measured capacities and time-to-first-byte estimates.
+
+``--curl-startup-bytes=<bytes>``
+    Explicit ordered startup byte budget (default: 0, infer from media bitrate
+    and remaining startup buffer target). Unknown bitrate uses a conservative
+    128 KiB demand fallback. The byte budget includes the leading request, and
+    may span multiple bounded-memory cohorts. Reaching this byte budget is not
+    proof that a container has been demuxed or that a video frame is playable.
+
+``--curl-startup-buffer-seconds=<seconds>``
+    Startup wall-time buffer target (default: 0.5). Startup ends when its ordered
+    byte budget is delivered or fresh playback feedback reaches this target.
+    Zero disables buffer-based completion. Without embedding-player feedback,
+    only the byte budget is used.
+
+``--curl-latency-ms=<milliseconds>``
+    Learned request-to-first-body-byte estimate (default: 0, unknown). This
+    includes DNS, connection/TLS setup and server/disk queueing; it is not a
+    pure network RTT. Used to amortize request overhead within the range and
+    memory ceilings. A high-latency seed or explicit useful demand avoids an
+    unconditional tiny leading request.
+
+``--curl-observed-bps=<bytes-per-second>``
+    Learned aggregate capacity seed (default: 0, unknown), used for bounded
+    range sizing. This is bytes/s, not bits/s, and is not added to traffic
+    counters or reported as a measured peak.
+
+``--curl-media-bitrate=<bits-per-second>``
+    Expected delivered-media bitrate (default: 0, unknown), including playback
+    speed when relevant. Do not supply an original-media bitrate when a
+    transcode has a different output rate. Zero disables bitrate-driven lane
+    trials. Embedding players can update this and buffer/pause state using
+    ``curl-transport-control``.
 
 DVB
 ---

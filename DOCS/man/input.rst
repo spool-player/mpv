@@ -2625,6 +2625,83 @@ Property list
 
     This is the same as ``demuxer-cache-state/raw-input-rate``.
 
+``curl-transport-metrics``
+    Libcurl transport diagnostics as a node map. Available when the curl backend
+    is initialized. No URLs, request headers or server identifiers are exposed.
+
+    ``received-bytes``, ``average-received-bytes-per-second``,
+    ``current-received-bytes-per-second``, ``peak-received-bytes-per-second``,
+    ``elapsed-seconds``
+        Traffic counters retained for this mpv core's lifetime, including seeks
+        and stream reopens. Received bytes are validated response-body chunks
+        observed by curl's write callbacks, including actual retransfers after
+        retries or seeks. Paused callback replay and ordered-buffer copies are
+        not counted again. Headers, TLS overhead and TCP retransmissions are
+        not counted; HTTP content decoding and socket buffering mean this is
+        not physical-interface throughput.
+
+        The average divides total bytes by wall time since the first request
+        started, including connection setup, pause and later idle time. Current
+        rate is the previous completed one-second window, quantized to 250 ms.
+        Peak is the largest such full window, never a short-window average;
+        it remains zero until a full second has elapsed. All rates are bytes/s.
+
+    ``active-requests``, ``peak-active-requests``, ``active-streams``,
+    ``peak-active-streams``, ``started-requests``, ``finished-requests``,
+    ``failed-requests``, ``retry-attempts``
+        Current activity and core-lifetime request counters. Removed/cancelled
+        handles need not produce a request-completion event.
+
+    ``requests-per-stream``, ``selected-requests``, ``range-bytes``, ``ring-bytes``
+        Latest stream's maximum lane budget, selected budget, configured maximum
+        range size and ring size. Active requests can be fewer than the budget.
+        Actual speculative segment sizes also obey the memory ceiling.
+
+    ``stream-id``, ``latency-ms``, ``capacity-bytes-per-second``, ``capacity-samples``
+        Monotonic identity of the latest opened stream, estimated first-byte
+        latency, and latest eligible capacity estimate/sample count. Capacity
+        data resets on a new stream; lifetime traffic does not. The latest
+        capacity point need not match a newly selected trial budget: use
+        ``concurrency-samples`` to associate a measurement with its budget.
+
+    ``lane-samples``
+        Array of used logical slot indices, not operating-system threads.
+        Entries contain ``lane`` (zero-based), ``received-bytes``,
+        ``active-seconds``, ``average-bytes-per-second``,
+        ``current-bytes-per-second``, ``peak-bytes-per-second``,
+        ``capacity-bytes-per-second`` and ``samples``. Slot indices are pooled
+        across streams. Traffic totals persist across reopen; active seconds
+        sum each assigned request's wall time, including setup and pauses.
+        Each average uses that slot's own bytes and duration, not aggregate
+        traffic divided by the current lane count. Capacity fields refer to
+        eligible requests in the latest stream.
+
+    ``concurrency-samples``
+        Array of actually measured operating points, each containing
+        ``requests`` (1-16), ``capacity-bytes-per-second``, ``latency-ms`` and
+        ``samples``. Uses eligible aggregate active wall time, including TTFB
+        and server stalls, but excluding intentional idle/backpressure. These
+        are measurements, not a curve extrapolated from individual lane rates.
+
+``curl-transport-control`` (write-only)
+    Embedding-player feedback map for an already-open curl stream. Required
+    fields are ``media-bitrate`` (nonnegative number, delivered bits/s),
+    ``buffer-seconds`` (nonnegative number, playback buffer in wall-time seconds)
+    and ``paused`` (boolean). Bitrate 0 means unknown. Divide a media-timeline
+    buffer duration by playback speed when supplying speed-adjusted bitrate.
+    This describes playback state; it does not itself pause playback.
+
+    Optional ``buffer-generation`` is a nonnegative integer that increases on
+    actual cache observations, not periodic resending of an old value. Clear
+    the buffer observation on load/seek. Buffer-based startup completion requires
+    an observation newer than the open/seek snapshot. Without this field, the
+    startup byte budget remains the completion fallback.
+
+    Updating feedback about once a second is sufficient for steady state;
+    promptly refresh cache/pause/seek observations at lifecycle changes. Learned
+    seed options apply to new streams, while this control updates existing ones.
+
+
 ``demuxer-cache-duration``
     Approximate duration of video buffered in the demuxer, in seconds. The
     guess is very unreliable, and often the property will not be available

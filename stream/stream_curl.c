@@ -186,6 +186,10 @@ struct curl_ctx {
     struct mp_dispatch_queue *dispatch;
     CURLM *multi;
     bool exit;
+
+    // Set when libcurl cannot be used anymore.
+    const char *error;
+    atomic_bool failed;
     atomic_int active_requests;
     atomic_int peak_active_requests;
     atomic_int active_streams;
@@ -266,13 +270,13 @@ struct priv {
     struct curl_handle_ref primary_ref;
     struct curl_slist *headers;
     char *url;
-    const char *effective_url;
     const struct curl_scheme *scheme;
 
     // Stream parameters
     bool seekable;
     int64_t content_size; // -1 if unknown
     int64_t start_offset; // requested initial byte offset, immutable after open
+    char *server_filename; // from Content-Disposition, NULL if absent
 
     // Producer state. Only touched by the curl thread.
     uint64_t request_start;    // absolute byte position of next request
@@ -282,6 +286,8 @@ struct priv {
     bool active;               // handle is currently active in the multi
     bool response_ok;          // current response matches the requested bytes
     bool finished;             // current request has reached EOF
+    bool reply_ranged;         // current response is a 206 byte range
+    bool reply_eof;            // current response marks the end of the file
 
     // Parallel ranged prefetch. Requests fill private segment buffers and are
     // appended to the shared ring in byte order after the primary request.
@@ -696,6 +702,20 @@ static void cmd_sync(struct priv *p, enum cmd_kind kind, int64_t pos, bool drop)
     mp_dispatch_run(p->ctx->dispatch, run_cmd, &c);
 }
 
+static void set_failed(struct curl_ctx *ctx, const char *error)
+{
+    ctx->error = error;
+    atomic_store_explicit(&ctx->failed, true, memory_order_release);
+}
+
+static bool curl_failed(struct curl_ctx *ctx, struct mp_log *log, int level)
+{
+    if (!atomic_load_explicit(&ctx->failed, memory_order_acquire))
+        return false;
+    mp_msg(log, level, "libcurl failed (%s), falling back to lavf\n", ctx->error);
+    return true;
+}
+
 static void curl_wakeup(void *arg)
 {
     struct curl_ctx *ctx = arg;
@@ -707,13 +727,29 @@ static MP_THREAD_VOID curl_thread(void *arg)
     mp_thread_set_name("curl");
     struct curl_ctx *ctx = arg;
 
-    curl_global_init(CURL_GLOBAL_ALL);
-    ctx->multi = curl_multi_init();
-    curl_multi_setopt(ctx->multi, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
-
-    mp_dispatch_set_wakeup_fn(ctx->dispatch, curl_wakeup, ctx);
+    CURLcode res = curl_global_init(CURL_GLOBAL_ALL);
+    if (res == CURLE_OK) {
+        ctx->multi = curl_multi_init();
+        if (!ctx->multi) {
+            res = CURLE_OUT_OF_MEMORY;
+            curl_global_cleanup();
+        }
+    }
+    if (res != CURLE_OK) {
+        set_failed(ctx, curl_easy_strerror(res));
+    } else {
+        curl_multi_setopt(ctx->multi, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
+        mp_dispatch_set_wakeup_fn(ctx->dispatch, curl_wakeup, ctx);
+    }
 
     while (!ctx->exit) {
+        // libcurl is unusable, but commands are still sent to this thread, so
+        // keep serving them until CMD_EXIT, or their senders would wait forever.
+        if (atomic_load_explicit(&ctx->failed, memory_order_relaxed)) {
+            mp_dispatch_queue_process(ctx->dispatch, INFINITY);
+            continue;
+        }
+
         mp_dispatch_queue_process(ctx->dispatch, 0);
 
         // Stop early to avoid delays, this happens only when player is closing.
@@ -722,8 +758,10 @@ static MP_THREAD_VOID curl_thread(void *arg)
 
         int running = 0;
         CURLMcode mres = curl_multi_perform(ctx->multi, &running);
-        if (mres != CURLM_OK && mres != CURLM_CALL_MULTI_PERFORM)
-            break;
+        if (mres != CURLM_OK && mres != CURLM_CALL_MULTI_PERFORM) {
+            set_failed(ctx, curl_multi_strerror(mres));
+            continue;
+        }
 
         CURLMsg *msg;
         int left = 0;
@@ -764,8 +802,10 @@ static MP_THREAD_VOID curl_thread(void *arg)
         curl_multi_poll(ctx->multi, NULL, 0, 250, NULL);
     }
 
-    curl_multi_cleanup(ctx->multi);
-    curl_global_cleanup();
+    if (ctx->multi) {
+        curl_multi_cleanup(ctx->multi);
+        curl_global_cleanup();
+    }
     MP_THREAD_RETURN();
 }
 
@@ -1008,6 +1048,34 @@ static bool parse_exact_content_range(const char *value, uint64_t *start,
     return true;
 }
 
+// "bytes <start>-<end>/<total>" where <total> may be "*". end is exclusive;
+// total is -1 when unknown.
+static bool parse_content_range(const char *value, uint64_t *start,
+                                uint64_t *end, int64_t *total)
+{
+    unsigned long long first = 0;
+    unsigned long long last = 0;
+    int consumed = 0;
+    if (!value ||
+        sscanf(value, "bytes %llu-%llu/%n", &first, &last, &consumed) != 2 ||
+        !consumed || last < first)
+    {
+        return false;
+    }
+    bstr rest = bstr_strip(bstr0(value + consumed));
+    long long size = -1;
+    if (!bstr_equals0(rest, "*")) {
+        bstr tail;
+        size = bstrtoll(rest, &tail, 10);
+        if (!rest.len || tail.len || size < 0 || last >= (unsigned long long)size)
+            return false;
+    }
+    *start = first;
+    *end = last + 1;
+    *total = size;
+    return true;
+}
+
 static size_t dynamic_write_callback(char *ptr, size_t size, size_t nmemb,
                                      void *userdata)
 {
@@ -1136,10 +1204,23 @@ static void probe_http(struct priv *p, struct bstr line)
     if (resp < 200 || (resp >= 300 && resp < 400))
         return;
 
+    // The first range of an empty file is not satisfiable. Its body is
+    // dropped and on_done() ends the stream.
+    if (resp == 416 && p->request_start == 0 &&
+        parse_content_range_total(header_value(p->curl, "Content-Range")) <= 0)
+    {
+        p->seekable = true;
+        p->content_size = 0;
+        p->reply_eof = true;
+        p->stream_ok = true;
+        goto done;
+    }
+
     if (!is_http_success(resp)) {
         MP_ERR(p, "HTTP error %ld\n", resp);
         goto done;
     }
+    p->reply_ranged = resp == 206;
 
     int64_t response_start = parse_content_range_start(p->curl);
 
@@ -1188,6 +1269,11 @@ static void probe_http(struct priv *p, struct bstr line)
             p->content_size = total;
         }
     }
+
+    const char *cd = header_value(p->curl, "Content-Disposition");
+    if (cd)
+        p->server_filename = mp_parse_content_disposition(p, p->s, bstr0(cd));
+
     p->stream_ok = true;
     p->response_ok = true;
     schedule_dynamic = p->seekable && exact_range &&
@@ -1235,14 +1321,36 @@ static void validate_http_response(struct priv *p, struct bstr line)
     uint64_t start = 0;
     uint64_t end = 0;
     int64_t total = -1;
+    const char *range = header_value(p->curl, "Content-Range");
+
+    // A 416 past the end of a file of unknown size is its end, and states
+    // the size if the server knows it by now. One that states a size past
+    // the requested offset contradicts itself and is an error.
+    if (resp == 416 && p->content_size < 0) {
+        total = parse_content_range_total(range);
+        if (total < 0 || total <= (int64_t)p->request_start) {
+            if (total >= 0) {
+                mp_mutex_lock(&p->mtx);
+                p->content_size = total;
+                mp_mutex_unlock(&p->mtx);
+            }
+            p->reply_eof = true;
+            p->response_ok = false;
+            return;
+        }
+    }
+
+    // Servers may cap a reply short of the requested range; on_done()
+    // continues from where it stopped.
+    p->reply_ranged = resp == 206;
     bool valid =
         is_http_success(resp) &&
         (!p->seekable ||
-         (resp == 206 && p->primary_end > p->request_start &&
-          parse_exact_content_range(header_value(p->curl, "Content-Range"),
-                              &start, &end, &total) &&
-          start == p->request_start && end == p->primary_end &&
-          total == p->content_size));
+         (resp == 206 &&
+          parse_content_range(range, &start, &end, &total) &&
+          start == p->request_start &&
+          (!p->primary_end || end <= p->primary_end) &&
+          (total == p->content_size || p->content_size < 0)));
     if (!valid) {
         MP_WARN(p, "range %" PRIu64 "-%" PRIu64
                    " rejected (HTTP %ld)\n",
@@ -1315,8 +1423,23 @@ static bool is_recoverable_error(CURLcode code)
     }
 }
 
+// The request could not be started. This also ends the probe in curl_open().
+static void request_failed(struct priv *p)
+{
+    mp_mutex_lock(&p->mtx);
+    p->probed = true;
+    p->stream_error = true;
+    mp_cond_broadcast(&p->cond);
+    mp_mutex_unlock(&p->mtx);
+}
+
 static void start_request(struct priv *p)
 {
+    if (atomic_load_explicit(&p->ctx->failed, memory_order_relaxed)) {
+        request_failed(p);
+        return;
+    }
+
     if (p->finished) {
         mp_mutex_lock(&p->mtx);
         p->stream_eof = true;
@@ -1331,7 +1454,7 @@ static void start_request(struct priv *p)
     bool chunked = ranged && p->opts->max_request_size > 0;
     bool capped = ranged && p->request_end > 0;
 
-    bool past_size = p->seekable && p->content_size > 0 && start >= p->content_size;
+    bool past_size = p->seekable && p->content_size >= 0 && start >= p->content_size;
     bool past_end = capped && start >= p->request_end;
     if (past_size || past_end) {
         p->finished = true;
@@ -1372,11 +1495,14 @@ static void start_request(struct priv *p)
     } else if (ranged) {
         snprintf(range, sizeof(range), "%" PRIu64 "-", start);
         curl_easy_setopt(p->curl, CURLOPT_RANGE, range);
+        p->primary_end = 0;
     } else {
         curl_easy_setopt(p->curl, CURLOPT_RANGE, NULL);
     }
     p->primary_done = false;
     p->response_ok = false;
+    p->reply_ranged = false;
+    p->reply_eof = false;
 
     p->request_received = 0;
     p->paused_bytes = 0;
@@ -1384,11 +1510,7 @@ static void start_request(struct priv *p)
     if (result != CURLM_OK) {
         MP_ERR(p, "could not start curl request: %s\n",
                curl_multi_strerror(result));
-        mp_mutex_lock(&p->mtx);
-        p->probed = true;
-        p->stream_error = true;
-        mp_cond_broadcast(&p->cond);
-        mp_mutex_unlock(&p->mtx);
+        request_failed(p);
         return;
     }
     begin_measurement(&p->primary_ref);
@@ -1868,8 +1990,20 @@ static void on_done(struct priv *p, CURLcode code)
 
     // Roll completed bytes into request_start so retries and chunk
     // continuations resume at the next missing byte.
-    p->request_start += p->request_received;
+    uint64_t received = p->request_received;
+    p->request_start += received;
     p->request_received = 0;
+
+    if (p->reply_eof && !aborted) {
+        // The reply marked the end of the file and its body was dropped, so
+        // the curl result means nothing.
+        p->finished = true;
+        mp_mutex_lock(&p->mtx);
+        p->stream_eof = true;
+        mp_cond_broadcast(&p->cond);
+        mp_mutex_unlock(&p->mtx);
+        return;
+    }
 
     if (code == CURLE_OK && p->response_ok && !aborted) {
         p->retry_count = 0;
@@ -1890,10 +2024,24 @@ static void on_done(struct priv *p, CURLcode code)
             }
         }
 
-        bool chunked = p->seekable && p->opts->max_request_size > 0;
-        bool past_size = p->content_size > 0 && p->request_start >= p->content_size;
+        // Keep requesting from where this reply stopped: requests are
+        // chunked, servers cap their replies, and with an unknown size only
+        // a 416 marks the end.
+        bool more = p->seekable &&
+                    (p->opts->max_request_size > 0 || p->reply_ranged);
+        bool past_size = p->content_size >= 0 && p->request_start >= p->content_size;
         bool past_end = p->request_end > 0 && p->request_start >= p->request_end;
-        if (chunked && !past_size && !past_end) {
+        if (more && !past_size && !past_end) {
+            if (!received) {
+                // The same request would be repeated forever.
+                MP_ERR(p, "Server sent back no data at offset %" PRIu64 "\n",
+                       p->request_start);
+                mp_mutex_lock(&p->mtx);
+                p->stream_error = true;
+                mp_cond_broadcast(&p->cond);
+                mp_mutex_unlock(&p->mtx);
+                return;
+            }
             start_request(p);
             return;
         }
@@ -2127,7 +2275,8 @@ static int curl_control(struct stream *s, int cmd, void *arg)
 static void priv_destructor(void *ptr)
 {
     struct priv *p = ptr;
-    mp_cancel_set_cb(p->s->cancel, NULL, NULL);
+    if (p->s->cancel)
+        mp_cancel_set_cb(p->s->cancel, NULL, NULL);
     if (p->curl) {
         cmd_sync(p, CMD_REMOVE, 0, false);
         curl_easy_cleanup(p->curl);
@@ -2144,7 +2293,8 @@ static void curl_close(struct stream *s)
     struct priv *p = s->priv;
     if (!p)
         return;
-    mp_cancel_set_cb(s->cancel, NULL, NULL);
+    if (s->cancel)
+        mp_cancel_set_cb(s->cancel, NULL, NULL);
     if (p->curl) {
         cmd_sync(p, CMD_REMOVE, 0, false);
         curl_easy_cleanup(p->curl);
@@ -2163,6 +2313,8 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
 
     struct curl_opts *opts = mp_get_config_group(s, s->global, &curl_conf);
     if (!opts->enabled)
+        return STREAM_NO_MATCH;
+    if (curl_failed(s->global->curl, s->log, MSGL_ERR))
         return STREAM_NO_MATCH;
 
     struct priv *p = talloc_zero(s, struct priv);
@@ -2218,7 +2370,7 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     p->curl = curl_easy_init();
     if (!p->curl) {
         MP_ERR(s, "curl_easy_init failed\n");
-        return STREAM_ERROR;
+        return STREAM_NO_MATCH;
     }
 
     p->headers = build_header_list(p);
@@ -2235,7 +2387,8 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     curl_easy_setopt(p->curl, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(p->curl, CURLOPT_XFERINFOFUNCTION, xferinfo_callback);
     curl_easy_setopt(p->curl, CURLOPT_XFERINFODATA, p);
-    mp_cancel_set_cb(s->cancel, on_cancel, p);
+    if (s->cancel)
+        mp_cancel_set_cb(s->cancel, on_cancel, p);
 
     cmd_sync(p, CMD_ADD, 0, false);
 
@@ -2244,6 +2397,9 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
         mp_cond_wait(&p->cond, &p->mtx);
     mp_mutex_unlock(&p->mtx);
 
+    // libcurl may have failed while the request was in flight.
+    if (!p->stream_ok && curl_failed(s->global->curl, s->log, MSGL_ERR))
+        return STREAM_NO_MATCH;
     if (!p->stream_ok || atomic_load(&p->aborted))
         return STREAM_ERROR;
 
@@ -2252,10 +2408,11 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     bstr mime = bstr_strip(bstr_split(bstr0(content_type), ";", NULL));
     if (mime.len)
         s->mime_type = bstrto0(s, mime);
+    s->server_filename = talloc_strdup(s, p->server_filename);
 
     const char *effective_url = NULL;
     curl_easy_getinfo(p->curl, CURLINFO_EFFECTIVE_URL, &effective_url);
-    p->effective_url = effective_url ? effective_url : p->url;
+    s->effective_url = talloc_strdup(s, effective_url);
 
     s->seekable = p->seekable;
     s->is_network = true;
@@ -2407,6 +2564,8 @@ static int open_curl_transport(struct demuxer *demuxer, AVIOContext **pb_out,
 
     // The context is required to be initialized in global.
     mp_require(demuxer->global && demuxer->global->curl);
+    if (curl_failed(demuxer->global->curl, demuxer->log, MSGL_V))
+        return AVERROR(ENOSYS);
 
     struct curl_open_args oa = {0};
     if (options && *options) {
@@ -2449,7 +2608,7 @@ static int open_curl_transport(struct demuxer *demuxer, AVIOContext **pb_out,
     c->av_class = &curl_avio_cookie_class;
     c->stream = s;
     c->cancel = cancel;
-    c->location = ((struct priv *)s->priv)->effective_url;
+    c->location = s->effective_url ? s->effective_url : s->url;
 
     void *buffer = av_malloc(64 * 1024);
     if (!buffer) {

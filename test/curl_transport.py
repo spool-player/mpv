@@ -225,7 +225,8 @@ class Origin:
                             first = start + 1 if inject and origin.fault == "range" else start
                             self.send_header("Content-Range", f"bytes {first}-{end - 1}/{len(origin.payload)}")
                         self.end_headers()
-                        stop = start + (end - start) // 2 if inject and origin.fault == "truncate" else end
+                        cut = inject and origin.fault in ("truncate", "stall")
+                        stop = start + (end - start) // 2 if cut else end
                         deadline = time.monotonic()
                         for offset in range(start, stop, 16384):
                             block = origin.payload[offset:min(offset + 16384, stop)]
@@ -239,6 +240,10 @@ class Origin:
                                 time.sleep(max(0, deadline - time.monotonic()))
                             self.wfile.write(block)
                             self.wfile.flush()
+                        if stop != end and origin.fault == "stall":
+                            # Go quiet with the connection open, as a server
+                            # that lost interest without closing does.
+                            time.sleep(STALL_SECONDS)
                         if stop != end:
                             self.close_connection = True
                 except (BrokenPipeError, ConnectionResetError):
@@ -263,6 +268,7 @@ class Origin:
 
 
 LIBRARY = None
+STALL_SECONDS = 30
 
 
 class CurlTransport(unittest.TestCase):
@@ -294,7 +300,10 @@ class CurlTransport(unittest.TestCase):
 
     def test_pause_seek_reopen_lifetime(self):
         with Origin(size=3 << 20, latency=0.02) as origin:
-            player = Player(LIBRARY, **{"pause": "yes", "curl-buffer-size": "64KiB"})
+            # The pause outlasts --network-timeout: a transfer held on a full
+            # ring is not a stall and must resume without a retry.
+            player = Player(LIBRARY, **{"pause": "yes", "curl-buffer-size": "64KiB",
+                                       "network-timeout": "1"})
             observed = {}
 
             def pause_seek_resume(current):
@@ -313,6 +322,7 @@ class CurlTransport(unittest.TestCase):
             try:
                 first = player.play(origin.url, loaded=pause_seek_resume)["metrics"]
                 self.assertGreaterEqual(first["received-bytes"], observed["before-seek"])
+                self.assertEqual(first["retry-attempts"], 0)
                 second = player.play(origin.url)["metrics"]
                 self.assertGreater(second["received-bytes"], first["received-bytes"])
                 self.assertGreater(second["stream-id"], first["stream-id"])
@@ -332,6 +342,19 @@ class CurlTransport(unittest.TestCase):
                 finally:
                     player.close()
                 self.assertEqual(output.read_bytes(), origin.pcm)
+
+    def test_stalled_transfer_is_retried_after_network_timeout(self):
+        with Origin(size=2 << 20, fault="stall") as origin, tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory) / "actual.pcm"
+            player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
+                                       "ao-pcm-waveheader": "no", "audio-format": "s16",
+                                       "curl-adaptive": "no", "network-timeout": "1"})
+            try:
+                result = player.play(origin.url, timeout=STALL_SECONDS - 5)
+                self.assertGreater(result["metrics"]["retry-attempts"], 0)
+            finally:
+                player.close()
+            self.assertEqual(output.read_bytes(), origin.pcm)
 
     def test_adapts_per_lane_limit_and_reverts_serialization(self):
         for serialized in (False, True):

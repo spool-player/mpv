@@ -16,6 +16,7 @@
  */
 
 #include <inttypes.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -1993,6 +1994,15 @@ static void setup_curl(struct priv *p, CURL *c)
     curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS,
                      (long)(p->opts->connect_timeout * 1000));
+    // Abort a transfer that receives nothing for --network-timeout seconds,
+    // as lavf's socket timeout does, so a connection that went quiet without
+    // closing is retried instead of starving the demuxer indefinitely.
+    // libcurl skips the check while a transfer is paused on a full ring.
+    if (p->net_opts->timeout > 0) {
+        curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1L);
+        curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME,
+                         (long)MPMAX(1, ceil(p->net_opts->timeout)));
+    }
 
     if (p->net_opts->useragent && p->net_opts->useragent[0])
         curl_easy_setopt(c, CURLOPT_USERAGENT, p->net_opts->useragent);

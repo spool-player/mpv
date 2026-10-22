@@ -5947,7 +5947,8 @@ Network
     Specify the network timeout in seconds (default: 60 seconds). This affects
     at least HTTP. The special value 0 uses the FFmpeg defaults. If a
     protocol is used which does not support timeouts, this option is silently
-    ignored.
+    ignored. With the libcurl backend it bounds how long a transfer may receive
+    nothing before it is retried; 0 disables that limit.
 
     .. warning::
 
@@ -6030,8 +6031,9 @@ TLS/connection diagnostics), set ``--msg-level=curl=trace``.
 
 ``--curl-connect-timeout=<seconds>``
     TCP/TLS connect timeout in seconds (default: 30, range 0-600). 0 lets
-    libcurl use its built-in default. The overall transfer timeout is
-    controlled by ``--network-timeout``.
+    libcurl use its built-in default. A transfer that then receives nothing
+    for ``--network-timeout`` seconds is aborted and retried from the next
+    missing byte (see ``--curl-max-retries``).
 
 ``--curl-buffer-size=<bytes>``
     Size of the per-stream producer-side ring buffer that decouples the

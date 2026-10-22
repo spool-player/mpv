@@ -601,6 +601,49 @@ static bool check_for_forced_eof(struct MPContext *mpctx)
     return forced_eof;
 }
 
+// A hardware video pipeline that failed underneath its decoder (webOS
+// Starfish) ends its stream and asks for a restart. Seeking to the frame it
+// stopped on rebuilds it there. A pipeline that keeps failing ends playback
+// with an error rather than playing on without picture.
+static bool check_for_pipeline_restart(struct MPContext *mpctx)
+{
+    struct vo_chain *vo_c = mpctx->vo_chain;
+
+    if (!vo_c->track || !vo_c->track->dec)
+        return false;
+
+    bool restart = false;
+    mp_decoder_wrapper_control(vo_c->track->dec, VDCTRL_CHECK_PIPELINE_RESTART,
+                               &restart);
+    if (!restart)
+        return false;
+
+    int64_t now = mp_time_ns();
+    if (!mpctx->video_restart_window_ns ||
+        now - mpctx->video_restart_window_ns > MP_TIME_S_TO_NS(60))
+    {
+        mpctx->video_restart_window_ns = now;
+        mpctx->video_restarts = 0;
+    }
+
+    double pts = mpctx->video_pts;
+    if (pts == MP_NOPTS_VALUE)
+        pts = get_current_time(mpctx);
+    if (pts == MP_NOPTS_VALUE || mpctx->video_restarts >= 3) {
+        MP_ERR(mpctx, "Video pipeline failed and could not be restarted.\n");
+        mpctx->stop_play = PT_ERROR;
+        mp_wakeup_core(mpctx);
+        return true;
+    }
+
+    mpctx->video_restarts++;
+    MP_WARN(mpctx, "Video pipeline failed; restarting it at %.3f "
+            "(attempt %d).\n", pts, mpctx->video_restarts);
+    queue_seek(mpctx, MPSEEK_ABSOLUTE, pts, MPSEEK_EXACT, 0);
+    mp_wakeup_core(mpctx);
+    return true;
+}
+
 /* Update avsync before a new video frame is displayed. Actually, this can be
  * called arbitrarily often before the actual display.
  * This adjusts the time of the next video frame */
@@ -1117,6 +1160,8 @@ void write_video(struct MPContext *mpctx)
 
     if (r == VD_EOF) {
         if (check_for_hwdec_fallback(mpctx))
+            return;
+        if (check_for_pipeline_restart(mpctx))
             return;
         if (check_for_forced_eof(mpctx)) {
             uninit_video_chain(mpctx);

@@ -1794,6 +1794,8 @@ static void play_current_file(struct MPContext *mpctx)
     mpctx->paused = false;
     mpctx->playing_msg_shown = false;
     mpctx->max_frames = -1;
+    mpctx->video_restarts = 0;
+    mpctx->video_restart_window_ns = 0;
     mpctx->video_speed = mpctx->audio_speed = opts->playback_speed;
     mpctx->speed_factor_a = mpctx->speed_factor_v = 1.0;
     mpctx->display_sync_error = 0.0;

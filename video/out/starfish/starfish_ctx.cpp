@@ -71,7 +71,7 @@ constexpr double CLOCK_EXPORT_MAX_RATE = 1.20;
 constexpr int64_t CLOCK_SEGMENT_TOLERANCE_NS = 5LL * 1000 * 1000 * 1000;
 constexpr int64_t WORKER_STATUS_PERIOD_NS = 1000LL * 1000 * 1000;
 constexpr int64_t FAILURE_WAKE_PERIOD_NS = 250LL * 1000 * 1000;
-constexpr int64_t BUFFERLOW_STALL_TIMEOUT_NS = 5000LL * 1000 * 1000;
+constexpr int64_t BUFFERLOW_STARVED_LOG_NS = 5000LL * 1000 * 1000;
 constexpr auto WORKER_IDLE_WAIT = std::chrono::milliseconds(20);
 constexpr auto BUFFERFULL_BACKOFF = std::chrono::milliseconds(25);
 
@@ -256,6 +256,7 @@ struct starfish_ctx {
   int64_t video_backpressure_pts_ns = INT64_MIN;
   std::string failure_reason;
   bool bufferlow_active = false;
+  bool bufferlow_starved_logged = false;
   int64_t bufferlow_start_ns = 0;
   int64_t bufferlow_last_progress_pts_ns = INT64_MIN;
   int64_t bufferlow_last_progress_host_ns = 0;
@@ -459,6 +460,12 @@ static void mark_pipeline_failed_locked(starfish_ctx *ctx, const char *reason) {
   ctx->failure_reason = reason ? reason : "unknown";
   ctx->last_failure_wake_ns = 0;
   ctx->video_backpressure_pts_ns = INT64_MIN;
+}
+
+// A queued flush is a restart in progress: the worker rebuilds a failed
+// pipeline when it applies it, so callers must not see the failure again.
+static bool failed_locked(starfish_ctx *ctx) {
+  return ctx->state == pipeline_state::FAILED && !ctx->flush_requested;
 }
 
 /* ----- DOVI / HDR helpers ------------------------------------------- */
@@ -671,6 +678,7 @@ static void prepare_segment_timeline_locked(starfish_ctx *ctx,
   ctx->clock_reject_suppressed = 0;
   ctx->video_backpressure_pts_ns = INT64_MIN;
   ctx->bufferlow_active = false;
+  ctx->bufferlow_starved_logged = false;
   ctx->bufferlow_start_ns = 0;
   ctx->bufferlow_last_progress_pts_ns = INT64_MIN;
   ctx->bufferlow_last_progress_host_ns = 0;
@@ -901,7 +909,7 @@ static void note_bufferlow_progress_locked(starfish_ctx *ctx,
   }
 }
 
-static bool bufferlow_stalled_locked(starfish_ctx *ctx, int64_t now) {
+static bool bufferlow_starved_locked(starfish_ctx *ctx, int64_t now) {
   if (!ctx->bufferlow_active || ctx->state != pipeline_state::PLAYING ||
       !ctx->started || ctx->stop || ctx->flush_requested || ctx->need_segment)
     return false;
@@ -914,7 +922,7 @@ static bool bufferlow_stalled_locked(starfish_ctx *ctx, int64_t now) {
                               : ctx->bufferlow_start_ns;
   if (last_progress <= 0)
     return false;
-  return now - last_progress >= BUFFERLOW_STALL_TIMEOUT_NS;
+  return now - last_progress >= BUFFERLOW_STARVED_LOG_NS;
 }
 
 static feed_result try_drain(starfish_ctx *ctx,
@@ -1326,7 +1334,19 @@ static void apply_flush_locked(starfish_ctx *ctx,
     prepare_segment_timeline_locked(ctx, ctx->pending_seek_target_ns,
                                     "seek-flush");
 
-  if (loaded) {
+  if (state_before_flush == pipeline_state::FAILED) {
+    // The player restarts a failed pipeline by seeking to where the picture
+    // stopped. Rebuild it there: the next packets load a fresh pipeline at
+    // the seek target. A failed Load left nothing to unload.
+    const std::string reason = ctx->failure_reason;
+    ctx->failure_reason.clear();
+    if (reason == "load-failed") {
+      mp_warn(ctx->log, "Starfish reloading pipeline after failed load\n");
+      ctx->state = pipeline_state::IDLE;
+    } else {
+      restart_loaded_pipeline_locked(ctx, lk, reason.c_str());
+    }
+  } else if (loaded) {
     // The webOS pipeline rejects Flush between LOADCOMPLETED and the first
     // Play. Continuing after that failure poisons Feed(), so reload at the
     // requested timestamp instead. Treat an unexpected steady-state Flush
@@ -1563,17 +1583,18 @@ static void worker_loop(starfish_ctx *ctx) {
         lk.lock();
         continue;
       }
-      if (bufferlow_stalled_locked(ctx, mp_time_ns())) {
-        log_worker_status_locked(ctx, "bufferlow-stall");
-        mp_err(ctx->log,
-               "Starfish BUFFERLOW stalled with no video progress; failing pipeline\n");
-        mark_pipeline_failed_locked(ctx, "bufferlow-stall");
-        clear_queues_locked(ctx);
-        lk.unlock();
-        wake_stream(ctx, STARFISH_STREAM_VIDEO);
-        wake_stream(ctx, STARFISH_STREAM_AUDIO);
-        lk.lock();
-        continue;
+      // Starfish ran dry because mpv had nothing to give it: the demuxer is
+      // waiting on the network. That is an underrun, not a pipeline fault,
+      // and the next packet resumes playback. Failing here left a playable
+      // stream with no video until the file was reopened.
+      if (!ctx->bufferlow_starved_logged &&
+          bufferlow_starved_locked(ctx, mp_time_ns())) {
+        ctx->bufferlow_starved_logged = true;
+        log_worker_status_locked(ctx, "bufferlow-starved");
+        mp_warn(ctx->log,
+                "Starfish has had no video input for %.1fs; waiting for "
+                "the demuxer\n",
+                (mp_time_ns() - ctx->bufferlow_start_ns) / 1e9);
       }
       if (ctx->state == pipeline_state::PLAYING && ctx->started &&
           ctx->clock_sample_valid && ctx->clock_sample_host_ns > 0 &&
@@ -1720,6 +1741,7 @@ static void backend_event_cb(void *opaque, enum sf_backend_event_type type,
   case SF_EVENT_BUFFER_LOW:
     mp_info(ctx->log, "Starfish Event: BUFFERLOW\n");
     ctx->bufferlow_active = true;
+    ctx->bufferlow_starved_logged = false;
     ctx->bufferlow_start_ns = event_host_ns;
     ctx->bufferlow_last_progress_pts_ns = ctx->current_pts_ns;
     ctx->bufferlow_last_progress_host_ns = event_host_ns;
@@ -2105,7 +2127,7 @@ int starfish_ctx_feed_video(struct starfish_ctx *ctx, const void *data,
   if (!ctx || !data || size == 0)
     return STARFISH_FEED_ERROR;
   std::lock_guard<std::mutex> lk(ctx->lock);
-  if (ctx->state == pipeline_state::FAILED)
+  if (failed_locked(ctx))
     return STARFISH_FEED_ERROR;
   if (!have_load_config(ctx))
     return STARFISH_FEED_ERROR;
@@ -2148,7 +2170,11 @@ int starfish_ctx_feed_video(struct starfish_ctx *ctx, const void *data,
   ctx->video_queue_bytes += size;
   ctx->video_queue.push_back(std::move(packet));
   ctx->video_backpressure_pts_ns = INT64_MIN;
+  if (ctx->bufferlow_starved_logged)
+    mp_warn(ctx->log, "Starfish video input resumed after %.1fs\n",
+            (mp_time_ns() - ctx->bufferlow_start_ns) / 1e9);
   ctx->bufferlow_active = false;
+  ctx->bufferlow_starved_logged = false;
   ctx->cv.notify_all();
   return STARFISH_FEED_OK;
 }
@@ -2158,7 +2184,7 @@ int starfish_ctx_feed_audio(struct starfish_ctx *ctx, const void *data,
   if (!ctx || !data || size == 0)
     return STARFISH_FEED_ERROR;
   std::lock_guard<std::mutex> lk(ctx->lock);
-  if (ctx->state == pipeline_state::FAILED)
+  if (failed_locked(ctx))
     return STARFISH_FEED_ERROR;
   if (ctx->flush_requested)
     return STARFISH_FEED_AGAIN;
@@ -2361,7 +2387,7 @@ bool starfish_ctx_is_failed(struct starfish_ctx *ctx) {
   if (!ctx)
     return true;
   std::lock_guard<std::mutex> lk(ctx->lock);
-  return ctx->state == pipeline_state::FAILED;
+  return failed_locked(ctx);
 }
 
 int starfish_ctx_get_video_width(struct starfish_ctx *ctx) {

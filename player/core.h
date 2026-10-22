@@ -393,6 +393,10 @@ typedef struct MPContext {
     double video_pts;
     // Last seek target.
     double last_seek_pts;
+    // Video pipeline restarts within the current window, for
+    // check_for_pipeline_restart().
+    int video_restarts;
+    int64_t video_restart_window_ns;
     // Frame duration field from demuxer. Only used for duration of the last
     // video frame.
     double last_frame_duration;

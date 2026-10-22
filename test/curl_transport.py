@@ -181,7 +181,8 @@ class Player:
 
 class Origin:
     def __init__(self, size=8 << 20, latency=0.04, per_lane=2 << 20,
-                 shared=0, serialized=False, reorder=False, fault=None):
+                 shared=0, serialized=False, reorder=False, fault=None,
+                 cap=0, unknown_size=False):
         pcm = (bytes(range(256)) * ((size + 255) // 256))[:size - size % 4]
         self.pcm = pcm
         self.payload = (b"RIFF" + struct.pack("<I", len(pcm) + 36) + b"WAVEfmt " +
@@ -189,6 +190,7 @@ class Origin:
                         b"data" + struct.pack("<I", len(pcm)) + pcm)
         self.latency, self.per_lane, self.shared = latency, per_lane, shared
         self.serialized, self.reorder, self.fault = serialized, reorder, fault
+        self.cap, self.unknown_size = cap, unknown_size
         self.lock = threading.Lock()
         self.disk = threading.Lock()
         self.next_shared = 0
@@ -207,8 +209,14 @@ class Origin:
                 start = int(match[1]) if match else 0
                 end = min(int(match[2]) + 1 if match and match[2] else len(origin.payload), len(origin.payload))
                 if start >= end:
-                    self.send_error(416)
+                    self.send_response(416)
+                    total = "*" if origin.unknown_size else len(origin.payload)
+                    self.send_header("Content-Range", f"bytes */{total}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
                     return
+                if origin.cap and match:
+                    end = min(end, start + origin.cap)
                 with origin.lock:
                     inject = bool(origin.fault and not origin.faulted and start > 0)
                     origin.faulted |= inject
@@ -223,7 +231,8 @@ class Origin:
                         self.send_header("Content-Length", str(end - start))
                         if match:
                             first = start + 1 if inject and origin.fault == "range" else start
-                            self.send_header("Content-Range", f"bytes {first}-{end - 1}/{len(origin.payload)}")
+                            total = "*" if origin.unknown_size else len(origin.payload)
+                            self.send_header("Content-Range", f"bytes {first}-{end - 1}/{total}")
                         self.end_headers()
                         cut = inject and origin.fault in ("truncate", "stall")
                         stop = start + (end - start) // 2 if cut else end
@@ -339,6 +348,21 @@ class CurlTransport(unittest.TestCase):
                 try:
                     metrics = player.play(origin.url)["metrics"]
                     self.assertGreater(metrics["retry-attempts"], 0)
+                finally:
+                    player.close()
+                self.assertEqual(output.read_bytes(), origin.pcm)
+
+    def test_capped_and_unsized_replies_are_continued(self):
+        # Servers may answer a range with less than was asked, and may not
+        # know the size, leaving a 416 to mark the end.
+        for origin_args in ({"cap": 100 << 10}, {"unknown_size": True}):
+            with self.subTest(**origin_args), Origin(size=2 << 20, **origin_args) as origin, \
+                    tempfile.TemporaryDirectory() as directory:
+                output = pathlib.Path(directory) / "actual.pcm"
+                player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
+                                           "ao-pcm-waveheader": "no", "audio-format": "s16"})
+                try:
+                    player.play(origin.url)
                 finally:
                     player.close()
                 self.assertEqual(output.read_bytes(), origin.pcm)

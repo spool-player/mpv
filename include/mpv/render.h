@@ -520,6 +520,8 @@ typedef struct mpv_render_param {
 #define MPV_RENDER_API_TYPE_SW "sw"
 // Fork extension. See render_vk.h
 #define MPV_RENDER_API_TYPE_VULKAN "vulkan"
+// Fork extension. See render_d3d11.h
+#define MPV_RENDER_API_TYPE_D3D11 "d3d11"
 
 /**
  * Flags used in mpv_render_frame_info.flags. Each value represents a bit in it.

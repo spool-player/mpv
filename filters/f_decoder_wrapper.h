@@ -82,6 +82,9 @@ enum dec_ctrl {
     // int*: extra hw surfaces retained
     VDCTRL_SET_EXTRA_HW_FRAMES,
     VDCTRL_CHECK_FORCED_EOF,
+    // bool*: the decoder's hardware pipeline failed and wants a restart
+    // (cleared on read)
+    VDCTRL_CHECK_PIPELINE_RESTART,
 };
 
 int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,

@@ -49,6 +49,8 @@ struct priv {
   bool allow_initial_geometry;
   bool wait_for_keyframe;
   bool pending_ctx_flush;
+  bool pipeline_failed;
+  bool restart_requested;
   bool hdr10plus_dovi_active;
   int hdr10plus_dovi_logs;
   uint8_t *hdr10plus_dovi_rpu;
@@ -744,6 +746,8 @@ static void reset_decoder_state(struct priv *p, bool allow_initial_geometry) {
   p->allow_initial_geometry = allow_initial_geometry;
   p->wait_for_keyframe = true;
   p->pending_ctx_flush = true;
+  p->pipeline_failed = false;
+  p->restart_requested = false;
   p->start_pts = MP_NOPTS_VALUE;
   if (p->bsf)
     av_bsf_flush(p->bsf);
@@ -802,6 +806,10 @@ static int control(struct mp_filter *f, enum dec_ctrl cmd, void *arg) {
   case VDCTRL_GET_HWDEC:
     *(char **)arg = "starfish";
     return CONTROL_TRUE;
+  case VDCTRL_CHECK_PIPELINE_RESTART:
+    *(bool *)arg = p->restart_requested;
+    p->restart_requested = false;
+    return CONTROL_TRUE;
   default:
     return CONTROL_UNKNOWN;
   }
@@ -810,8 +818,19 @@ static int control(struct mp_filter *f, enum dec_ctrl cmd, void *arg) {
 static void vd_starfish_process(struct mp_filter *f) {
   struct priv *p = f->priv;
   if (starfish_ctx_is_failed(p->ctx)) {
-    MP_ERR(p, "vd_starfish: Starfish pipeline failed\n");
-    mp_filter_internal_mark_failed(f);
+    // End the stream once and let the player restart the pipeline with a
+    // seek (VDCTRL_CHECK_PIPELINE_RESTART). Nothing handles a failed decoder
+    // filter, so marking it failed left playback running with no video.
+    if (!p->pipeline_failed) {
+      MP_ERR(p, "vd_starfish: Starfish pipeline failed\n");
+      p->pipeline_failed = true;
+      p->restart_requested = true;
+      clear_pending(p);
+    }
+    if (!p->sent_eof && mp_pin_in_needs_data(f->ppins[1])) {
+      p->sent_eof = true;
+      mp_pin_in_write(f->ppins[1], MP_EOF_FRAME);
+    }
     return;
   }
 

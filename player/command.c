@@ -1754,6 +1754,15 @@ static int mp_property_curl_transport_metrics(void *ctx,
     node_map_add_int64(result, "current-received-bytes-per-second",
                        metrics.current_received_bytes_per_second);
     node_map_add_double(result, "elapsed-seconds", metrics.elapsed_seconds);
+    node_map_add_double(result, "curl-thread-cpu-seconds",
+                        metrics.curl_thread_cpu_seconds);
+    node_map_add_double(result, "curl-thread-wall-seconds",
+                        metrics.curl_thread_wall_seconds);
+    node_map_add_flag(result, "curl-thread-cpu-available",
+                      metrics.curl_thread_cpu_available);
+    node_map_add_double(result, "ring-wait-seconds", metrics.ring_wait_seconds);
+    node_map_add_double(result, "consumer-wait-seconds",
+                        metrics.consumer_wait_seconds);
     node_map_add_int64(result, "selected-requests", metrics.selected_requests);
     node_map_add_double(result, "latency-ms", metrics.latency_ms);
     node_map_add_int64(result, "capacity-bytes-per-second",

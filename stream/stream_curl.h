@@ -65,6 +65,15 @@ struct mp_curl_metrics {
     int64_t peak_received_bytes_per_second;
     int64_t current_received_bytes_per_second;
     double elapsed_seconds;
+    // Lifetime worker CPU and wall clocks; wall time includes idle/poll waits.
+    double curl_thread_cpu_seconds;
+    double curl_thread_wall_seconds;
+    bool curl_thread_cpu_available;
+    // Summed wall time across streams (not CPU time). Consumer waits are
+    // accounted when the empty-ring wait completes; producer waits include
+    // currently blocked streams.
+    double ring_wait_seconds;
+    double consumer_wait_seconds;
     int64_t selected_requests;
     double latency_ms;
     int64_t capacity_bytes_per_second;

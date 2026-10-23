@@ -2690,6 +2690,16 @@ Property list
         since the previous read of this property, and for the core's lifetime.
         It is CPU scheduling delay, not network latency.
 
+    ``playback-state-updates``, ``playback-buffer-seconds``,
+    ``playback-demand-bits-per-second``, ``playback-user-paused``
+        Playback state the player reports to the transport every 250 ms while
+        a curl stream is open, including while the cache is full. Demand is the
+        larger of the demuxer's measured audio plus video bitrate (scaled by
+        playback speed) and the ``curl-transport-control`` bitrate. Only
+        the viewer's pause counts as paused; pausing for cache does not. Once
+        the player reports, ``curl-transport-control`` supplies only that
+        bitrate prior, and its buffer and pause fields are ignored.
+
     ``stream-id``, ``latency-ms``, ``capacity-bytes-per-second``, ``capacity-samples``
         Monotonic identity of the latest opened stream, estimated first-byte
         latency, and latest eligible capacity estimate/sample count. Capacity

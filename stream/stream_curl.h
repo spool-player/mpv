@@ -30,6 +30,23 @@ struct demuxer;
 // Initialize libcurl state, must be called before stream_curl is used.
 void mp_curl_global_init(struct mpv_global *global);
 
+// Playback facts the player supplies to the transport, at most every 250 ms.
+// Rates are bits/s of media consumption (already scaled by speed); negative
+// values are unknown.
+struct mp_curl_playback_state {
+    double buffer_seconds;
+    int64_t fw_bytes, max_fw_bytes;
+    double speed;
+    double audio_bitrate, video_bitrate;
+    bool idle, underrun, eof, user_paused, seeking;
+};
+
+// Never blocks on the transport; the latest state wins.
+void mp_curl_set_playback_state(struct mpv_global *global,
+                                const struct mp_curl_playback_state *state);
+// Whether any curl stream is open, i.e. whether playback state is wanted.
+bool mp_curl_has_streams(struct mpv_global *global);
+
 #define MP_CURL_MAX_LANES 16
 
 struct mp_curl_lane_metrics {
@@ -83,6 +100,11 @@ struct mp_curl_metrics {
     // snapshot, and for the worker's lifetime.
     double recent_lateness_ms;
     double peak_lateness_ms;
+    // Playback state as the transport sees it.
+    int64_t playback_state_updates; // player reports received
+    double playback_buffer_seconds;
+    double playback_demand_bitrate; // bits/s used as demand, 0 unknown
+    bool playback_user_paused;
     int64_t selected_requests;
     double latency_ms;
     int64_t capacity_bytes_per_second;

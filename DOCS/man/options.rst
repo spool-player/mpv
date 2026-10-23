@@ -6041,9 +6041,11 @@ TLS/connection diagnostics), set ``--msg-level=curl=trace``.
     Lower values may reduce in-flight data and reduce latency.
 
 ``--curl-read-size=<bytes>``
-    Receive buffer for each libcurl transfer (default: 256KiB, 16KiB to
-    10MiB). Larger values deliver body data in fewer callbacks and receive
-    calls; every active request holds one buffer.
+    Preferred libcurl receive buffer size (default: 256KiB, 16KiB to 10MiB).
+    Larger values may reduce receive calls, but body write callbacks remain
+    capped by libcurl's ``CURL_MAX_WRITE_SIZE``. Since curl 8.7, one transfer
+    buffer is shared by every easy handle in a multi handle; older curl
+    versions allocate per transfer. This is not a whole-process memory limit.
 
 ``--curl-max-request-size=<bytes>``
     For seekable streams, split the transfer into Range requests of at most

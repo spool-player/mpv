@@ -2690,6 +2690,12 @@ Property list
     ``streams``, ``connections``, ``snapshot-truncated``
         Bounded arrays of at most 64 rows each. Stream rows contain opaque
         monotonic ``stream-id`` and current readable/retained/reorder gauges.
+        ``prefix-publication-available`` is false without a strong ETag: the
+        incomplete leading range's body stays retained but hidden until its
+        exact response completes successfully. Strong validators permit
+        immediate prefixes and ``If-Range`` suffix retries; changed or omitted
+        validators cannot splice representations. Hidden bytes in the leading
+        descriptor are not themselves reorder bytes.
         Connection rows contain opaque ``connection-id``, monotonic
         ``socket-generation``, effective ``http-version`` (0 unknown,
         10/11/20/30), physical ``transport`` (0 unknown, 1 TCP, 2 UDP), and

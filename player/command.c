@@ -1774,6 +1774,7 @@ static int mp_property_curl_transport_metrics(void *ctx,
         node_map_add_int64(entry, "readable-bytes", stream->readable_bytes);
         node_map_add_int64(entry, "retained-bytes", stream->retained_bytes);
         node_map_add_int64(entry, "reorder-bytes", stream->reorder_bytes);
+        node_map_add_flag(entry, "prefix-publication-available", stream->prefix_publication_available);
     }
     struct mpv_node *connections = node_map_add(result, "connections", MPV_FORMAT_NODE_ARRAY);
     for (int n = 0; n < metrics.num_connections; n++) {

@@ -18,8 +18,26 @@
 #include <inttypes.h>
 #include <math.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+
+#if defined(__linux__) || defined(__APPLE__)
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#define HAVE_SOCKET_PROBES 1
+#endif
+#if defined(__linux__)
+#include <sys/auxv.h>
+#if defined(__arm__) && __has_include(<asm/hwcap.h>)
+#include <asm/hwcap.h>
+#endif
+#endif
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 
 #include <curl/curl.h>
 
@@ -185,6 +203,17 @@ struct curl_rate {
     int64_t active_ns;
 };
 
+#define MP_CURL_MAX_SOCKETS 64
+
+// A socket libcurl opened through us. Entries live as long as the core: a
+// pooled connection outlives the transfers that used it.
+struct curl_socket_info {
+    curl_socket_t fd; // CURL_SOCKET_BAD when the entry is free
+    bool tcp;
+    int64_t receive_buffer; // effective SO_RCVBUF read-back, -1 unknown
+    double rtt_ms;          // kernel smoothed RTT, -1 unavailable
+};
+
 struct curl_ctx {
     mp_thread thread;
     struct mp_dispatch_queue *dispatch;
@@ -211,6 +240,13 @@ struct curl_ctx {
     int64_t thread_cpu_started_ns;
     struct curl_rate ring_wait;
     atomic_int_fast64_t consumer_wait_ns;
+    // Sockets and host limits, owned by the curl thread.
+    struct curl_socket_info sockets[MP_CURL_MAX_SOCKETS];
+    uint64_t sockets_opened;
+    int64_t next_socket_sample_ns;
+    int64_t host_rmem_max;      // unprivileged SO_RCVBUF ceiling, -1 unknown
+    int64_t host_autotune_max;  // receive autotuning ceiling, -1 unknown
+    int hw_aes;                 // 1 yes, 0 no, -1 unknown
     // Player state handed over without waiting for this thread.
     mp_mutex state_lock;
     struct mp_curl_playback_state pending_state;
@@ -875,6 +911,151 @@ static void release_share(void)
     mp_mutex_unlock(&share_lock);
 }
 
+// Socket and host probes. They report what the kernel says; every probe
+// that cannot answer is unavailable (-1), never a plausible zero.
+
+static int detect_hw_aes(void)
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    return 1;
+#elif defined(__linux__) && defined(__aarch64__) && defined(HWCAP_AES)
+    return !!(getauxval(AT_HWCAP) & HWCAP_AES);
+#elif defined(__linux__) && defined(__arm__) && defined(HWCAP2_AES)
+    return !!(getauxval(AT_HWCAP2) & HWCAP2_AES);
+#elif (defined(__x86_64__) || defined(__i386__)) && defined(__GNUC__)
+    __builtin_cpu_init();
+    return !!__builtin_cpu_supports("aes");
+#else
+    return -1;
+#endif
+}
+
+#if defined(__linux__)
+// The field'th whitespace-separated integer of a small /proc file.
+static int64_t read_proc_value(const char *path, int field)
+{
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+    long long value = -1;
+    for (int n = 0; n <= field; n++) {
+        if (fscanf(f, "%lld", &value) != 1) {
+            value = -1;
+            break;
+        }
+    }
+    fclose(f);
+    return value >= 0 ? value : -1;
+}
+#endif
+
+#if defined(__APPLE__)
+static int64_t read_sysctl_value(const char *name)
+{
+    uint64_t value = 0; // a 4-byte answer fills the low half
+    size_t len = sizeof(value);
+    if (sysctlbyname(name, &value, &len, NULL, 0) != 0 ||
+        (len != 4 && len != 8))
+    {
+        return -1;
+    }
+    return len == 4 ? (int64_t)(uint32_t)value : (int64_t)value;
+}
+#endif
+
+static void probe_host_limits(struct curl_ctx *ctx)
+{
+    ctx->host_rmem_max = ctx->host_autotune_max = -1;
+#if defined(__linux__)
+    ctx->host_rmem_max = read_proc_value("/proc/sys/net/core/rmem_max", 0);
+    ctx->host_autotune_max = read_proc_value("/proc/sys/net/ipv4/tcp_rmem", 2);
+#elif defined(__APPLE__)
+    ctx->host_rmem_max = read_sysctl_value("kern.ipc.maxsockbuf");
+    ctx->host_autotune_max = read_sysctl_value("net.inet.tcp.autorcvbufmax");
+#endif
+    ctx->hw_aes = detect_hw_aes();
+    for (int n = 0; n < MP_CURL_MAX_SOCKETS; n++)
+        ctx->sockets[n].fd = CURL_SOCKET_BAD;
+}
+
+#if HAVE_SOCKET_PROBES
+static curl_socket_t open_socket_cb(void *clientp, curlsocktype purpose,
+                                    struct curl_sockaddr *address)
+{
+    struct curl_ctx *ctx = clientp;
+    int type = address->socktype;
+    // libcurl may already have tucked creation flags into the type.
+    int kind = type;
+#ifdef SOCK_CLOEXEC
+    kind &= ~SOCK_CLOEXEC;
+    type |= SOCK_CLOEXEC;
+#endif
+#ifdef SOCK_NONBLOCK
+    kind &= ~SOCK_NONBLOCK;
+#endif
+    curl_socket_t fd = socket(address->family, type, address->protocol);
+    if (fd == CURL_SOCKET_BAD)
+        return fd;
+    ctx->sockets_opened++;
+    // A full table only loses observation, never the connection.
+    for (int n = 0; n < MP_CURL_MAX_SOCKETS; n++) {
+        struct curl_socket_info *info = &ctx->sockets[n];
+        if (info->fd == CURL_SOCKET_BAD) {
+            *info = (struct curl_socket_info){
+                .fd = fd,
+                .tcp = kind == SOCK_STREAM,
+                .receive_buffer = -1,
+                .rtt_ms = -1,
+            };
+            break;
+        }
+    }
+    return fd;
+}
+
+static int close_socket_cb(void *clientp, curl_socket_t fd)
+{
+    struct curl_ctx *ctx = clientp;
+    for (int n = 0; n < MP_CURL_MAX_SOCKETS; n++) {
+        if (ctx->sockets[n].fd == fd)
+            ctx->sockets[n].fd = CURL_SOCKET_BAD;
+    }
+    return close(fd);
+}
+
+static void sample_sockets(struct curl_ctx *ctx)
+{
+    for (int n = 0; n < MP_CURL_MAX_SOCKETS; n++) {
+        struct curl_socket_info *info = &ctx->sockets[n];
+        if (info->fd == CURL_SOCKET_BAD)
+            continue;
+        int buffer = 0;
+        socklen_t len = sizeof(buffer);
+        info->receive_buffer =
+            getsockopt(info->fd, SOL_SOCKET, SO_RCVBUF, &buffer, &len) == 0
+            ? buffer : -1;
+        info->rtt_ms = -1;
+        if (!info->tcp)
+            continue;
+#if defined(__linux__) && defined(TCP_INFO)
+        // Old SDKs have a shorter struct; trust only fields the kernel filled.
+        struct tcp_info tcp = {0};
+        len = sizeof(tcp);
+        if (getsockopt(info->fd, IPPROTO_TCP, TCP_INFO, &tcp, &len) == 0 &&
+            len >= offsetof(struct tcp_info, tcpi_rtt) + sizeof(tcp.tcpi_rtt))
+        {
+            info->rtt_ms = tcp.tcpi_rtt / 1000.0;
+        }
+#elif defined(__APPLE__) && defined(TCP_CONNECTION_INFO)
+        struct tcp_connection_info tcp = {0};
+        len = sizeof(tcp);
+        if (getsockopt(info->fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &tcp, &len) == 0)
+            info->rtt_ms = tcp.tcpi_srtt;
+#endif
+    }
+}
+#endif
+
 static MP_THREAD_VOID curl_thread(void *arg)
 {
     mp_thread_set_name("curl");
@@ -882,6 +1063,7 @@ static MP_THREAD_VOID curl_thread(void *arg)
     ctx->thread_started_ns = mp_time_ns();
     ctx->thread_cpu_started_ns =
         mp_thread_cpu_time_ns(mp_thread_current_id());
+    probe_host_limits(ctx);
 
     CURLcode res = curl_global_init(CURL_GLOBAL_ALL);
     if (res == CURLE_OK) {
@@ -909,6 +1091,12 @@ static MP_THREAD_VOID curl_thread(void *arg)
 
         mp_dispatch_queue_process(ctx->dispatch, 0);
         apply_playback_state(ctx);
+#if HAVE_SOCKET_PROBES
+        if (mp_time_ns() >= ctx->next_socket_sample_ns) {
+            ctx->next_socket_sample_ns = mp_time_ns() + MP_TIME_MS_TO_NS(500);
+            sample_sockets(ctx);
+        }
+#endif
 
         // Stop early to avoid delays, this happens only when player is closing.
         if (ctx->exit)
@@ -1039,6 +1227,30 @@ static int64_t count_connections(struct curl_ctx *ctx)
     return count;
 }
 
+static void read_socket_metrics(struct curl_ctx *ctx,
+                                struct mp_curl_metrics *metrics)
+{
+    metrics->tcp_rtt_min_ms = metrics->tcp_rtt_max_ms = -1;
+    metrics->max_socket_receive_buffer = -1;
+    for (int n = 0; n < MP_CURL_MAX_SOCKETS; n++) {
+        const struct curl_socket_info *info = &ctx->sockets[n];
+        if (info->fd == CURL_SOCKET_BAD)
+            continue;
+        metrics->open_sockets++;
+        metrics->max_socket_receive_buffer =
+            MPMAX(metrics->max_socket_receive_buffer, info->receive_buffer);
+        if (info->rtt_ms >= 0) {
+            metrics->tcp_rtt_min_ms = metrics->tcp_rtt_min_ms < 0
+                ? info->rtt_ms : MPMIN(metrics->tcp_rtt_min_ms, info->rtt_ms);
+            metrics->tcp_rtt_max_ms = MPMAX(metrics->tcp_rtt_max_ms, info->rtt_ms);
+        }
+    }
+    metrics->sockets_opened = ctx->sockets_opened;
+    metrics->host_rmem_max = ctx->host_rmem_max;
+    metrics->host_autotune_max = ctx->host_autotune_max;
+    metrics->hw_aes = ctx->hw_aes;
+}
+
 static void read_metrics(void *arg)
 {
     struct metrics_snapshot *snapshot = arg;
@@ -1110,6 +1322,7 @@ static void read_metrics(void *arg)
         .capacity_samples = ctx->capacity_samples,
         .stream_id = ctx->stream_id,
     };
+    read_socket_metrics(ctx, metrics);
     for (int n = 0; n < MP_CURL_MAX_LANES; n++) {
         struct curl_rate *lane = &ctx->lanes[n];
         double active = MP_TIME_NS_TO_S(lane->active_ns +
@@ -2645,6 +2858,12 @@ static void setup_curl(struct priv *p, CURL *c)
 
     if (p->headers)
         curl_easy_setopt(c, CURLOPT_HTTPHEADER, p->headers);
+#if HAVE_SOCKET_PROBES
+    curl_easy_setopt(c, CURLOPT_OPENSOCKETFUNCTION, open_socket_cb);
+    curl_easy_setopt(c, CURLOPT_OPENSOCKETDATA, p->ctx);
+    curl_easy_setopt(c, CURLOPT_CLOSESOCKETFUNCTION, close_socket_cb);
+    curl_easy_setopt(c, CURLOPT_CLOSESOCKETDATA, p->ctx);
+#endif
 }
 
 // stream_curl implementation

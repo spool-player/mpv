@@ -1746,6 +1746,16 @@ static int mp_property_curl_transport_metrics(void *ctx,
                         metrics.recent_lateness_ms);
     node_map_add_double(result, "peak-scheduling-lateness-ms",
                         metrics.peak_lateness_ms);
+    node_map_add_int64(result, "open-sockets", metrics.open_sockets);
+    node_map_add_int64(result, "sockets-opened", metrics.sockets_opened);
+    node_map_add_double(result, "tcp-rtt-min-ms", metrics.tcp_rtt_min_ms);
+    node_map_add_double(result, "tcp-rtt-max-ms", metrics.tcp_rtt_max_ms);
+    node_map_add_int64(result, "max-socket-receive-buffer-bytes",
+                       metrics.max_socket_receive_buffer);
+    node_map_add_int64(result, "host-rmem-max-bytes", metrics.host_rmem_max);
+    node_map_add_int64(result, "host-receive-autotune-max-bytes",
+                       metrics.host_autotune_max);
+    node_map_add_int64(result, "hw-aes", metrics.hw_aes);
     node_map_add_int64(result, "playback-state-updates",
                        metrics.playback_state_updates);
     node_map_add_double(result, "playback-buffer-seconds",

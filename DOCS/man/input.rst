@@ -2683,6 +2683,20 @@ Property list
         since the previous read of this property, and for the core's lifetime.
         It is CPU scheduling delay, not network latency.
 
+    ``open-sockets``, ``sockets-opened``, ``tcp-rtt-min-ms``, ``tcp-rtt-max-ms``, ``max-socket-receive-buffer-bytes``
+        Sockets libcurl opened for this core, sampled every 500 ms on Linux
+        and Apple platforms (unavailable elsewhere). RTT is the kernel's
+        smoothed TCP round-trip time across open TCP sockets, not request
+        time-to-first-byte; the receive buffer is the effective ``SO_RCVBUF``
+        read-back, which is socket accounting, not the advertised window. -1
+        means unavailable.
+
+    ``host-rmem-max-bytes``, ``host-receive-autotune-max-bytes``, ``hw-aes``
+        The unprivileged ``SO_RCVBUF`` ceiling and the receive-autotuning
+        ceiling the system reports (Linux ``rmem_max`` and ``tcp_rmem``, Apple
+        ``kern.ipc.maxsockbuf`` and ``net.inet.tcp.autorcvbufmax``), and
+        whether the CPU has AES instructions (1, 0, or -1 unknown).
+
     ``playback-state-updates``, ``playback-buffer-seconds``,
     ``playback-demand-bits-per-second``, ``playback-user-paused``
         Playback state the player reports to the transport every 250 ms while

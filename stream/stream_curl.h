@@ -100,6 +100,14 @@ struct mp_curl_metrics {
     // snapshot, and for the worker's lifetime.
     double recent_lateness_ms;
     double peak_lateness_ms;
+    // Sockets as the kernel reports them (-1 unavailable). RTT is the kernel's
+    // smoothed TCP RTT, never request time-to-first-byte.
+    int64_t open_sockets;
+    int64_t sockets_opened;
+    double tcp_rtt_min_ms, tcp_rtt_max_ms;
+    int64_t max_socket_receive_buffer;
+    int64_t host_rmem_max, host_autotune_max;
+    int hw_aes;
     // Playback state as the transport sees it.
     int64_t playback_state_updates; // player reports received
     double playback_buffer_seconds;

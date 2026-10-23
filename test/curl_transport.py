@@ -208,6 +208,7 @@ class Origin:
         self.replaced = False
         self.resumed = []  # per TLS request: did the handshake resume a session
         self.fault_range = None
+        self.pause_started = threading.Event()
         self.pause_window = None
         self.active = 0
         self.lock = threading.Lock()
@@ -268,6 +269,7 @@ class Origin:
                             if origin.pause and origin.pause_window is None and \
                                     offset <= origin.pause[0] < offset + 16384:
                                 paused = time.monotonic()
+                                origin.pause_started.set()
                                 time.sleep(origin.pause[1])
                                 origin.pause_window = (paused, time.monotonic())
                             block = payload[offset:min(offset + 16384, stop)]
@@ -449,6 +451,35 @@ class CurlTransport(unittest.TestCase):
             connections = [sample["physical-connections"] for _, sample in result["samples"]]
             self.assertGreaterEqual(max(connections), 2)
             self.assertLessEqual(max(connections), 4)
+
+    def test_seek_during_partial_publication_delivers_exact_bytes(self):
+        # Seek while one range is half published and later ranges are
+        # retained: the queue is torn down mid-flight, and everything played
+        # after the seek must be exactly the file from the seek target on.
+        mib = 1 << 20
+        with Origin(size=6 << 20, latency=0.01, per_lane=4 << 20,
+                    pause=(mib + mib // 2, 3.0)) as origin, tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory) / "actual.pcm"
+            player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output, "ao-pcm-waveheader": "no",
+                                       "audio-format": "s16", "curl-adaptive": "no",
+                                       "curl-max-request-size": "1MiB", "curl-buffer-size": "8MiB"})
+            target = 2.0
+
+            def seek_during_pause():
+                if origin.pause_started.wait(30):
+                    time.sleep(0.5)
+                    player.command("seek", target, "absolute+exact")
+
+            seeker = threading.Thread(target=seek_during_pause, daemon=True)
+            try:
+                seeker.start()
+                player.play(origin.url)
+                seeker.join(5)
+            finally:
+                player.close()
+            self.assertIsNotNone(origin.pause_window)
+            tail = origin.pcm[int(target * 192000):]
+            self.assertTrue(output.read_bytes().endswith(tail))
 
     def test_retry_resumes_or_verifies_published_prefix(self):
         # A range truncated after its prefix was published is completed from

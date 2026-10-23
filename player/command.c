@@ -1782,6 +1782,12 @@ static int mp_property_curl_transport_metrics(void *ctx,
     node_map_add_int64(result, "host-receive-autotune-max-bytes",
                        metrics.host_autotune_max);
     node_map_add_int64(result, "hw-aes", metrics.hw_aes);
+    node_map_add_int64(result, "playback-epoch", metrics.playback_epoch);
+    node_map_add_int64(result, "stale-controls", metrics.stale_controls);
+    node_map_add_int64(result, "rejected-controls", metrics.rejected_controls);
+    node_map_add_flag(result, "background-network", metrics.background_network);
+    node_map_add_double(result, "declared-bits-per-second",
+                        metrics.declared_bitrate);
     node_map_add_int64(result, "playback-state-updates",
                        metrics.playback_state_updates);
     node_map_add_double(result, "playback-buffer-seconds",
@@ -1830,20 +1836,55 @@ static int mp_property_curl_transport_metrics(void *ctx,
     return M_PROPERTY_OK;
 }
 
-static bool curl_control_number(struct mpv_node *map, const char *key,
-                                 double *number)
+// Every key must be known for its op and well-typed, or nothing changes.
+static bool curl_control_field(struct mpv_node *node, const char *key,
+                               struct mp_curl_control *c)
 {
-    struct mpv_node *node = node_map_get(map, key);
-    if (!node)
-        return false;
-    if (node->format == MPV_FORMAT_DOUBLE) {
-        *number = node->u.double_;
-    } else if (node->format == MPV_FORMAT_INT64) {
-        *number = node->u.int64;
-    } else {
-        return false;
+    bool number = node->format == MPV_FORMAT_DOUBLE ||
+                  node->format == MPV_FORMAT_INT64;
+    double value = node->format == MPV_FORMAT_DOUBLE ? node->u.double_
+                 : node->format == MPV_FORMAT_INT64 ? node->u.int64 : -1;
+    bool count = node->format == MPV_FORMAT_INT64 && node->u.int64 >= 0;
+    bool finite = number && isfinite(value) && value >= 0;
+    if (!strcmp(key, "format"))
+        return node->format == MPV_FORMAT_INT64 && node->u.int64 == 2;
+    if (!strcmp(key, "op"))
+        return true; // checked by the caller
+    if (!strcmp(key, "playback-epoch")) {
+        c->epoch = node->format == MPV_FORMAT_INT64 ? node->u.int64 : 0;
+        return c->epoch > 0;
     }
-    return isfinite(*number) && *number >= 0;
+    if (c->op == 1) {
+        if (strcmp(key, "background-network") || node->format != MPV_FORMAT_FLAG)
+            return false;
+        c->background_network = node->u.flag;
+        return true;
+    }
+    if (!strcmp(key, "source-bitrate") || !strcmp(key, "delivery-bitrate")) {
+        if (!finite || value > 1e12)
+            return false;
+        *(key[0] == 's' ? &c->source_bitrate : &c->delivery_bitrate) = value;
+        return true;
+    }
+    if (!strcmp(key, "source-size-bytes") || !strcmp(key, "delivery-size-bytes")) {
+        if (!count)
+            return false;
+        *(key[0] == 's' ? &c->source_size : &c->delivery_size) = node->u.int64;
+        return true;
+    }
+    if (!strcmp(key, "source-duration-seconds") ||
+        !strcmp(key, "delivery-duration-seconds"))
+    {
+        if (!finite)
+            return false;
+        *(key[0] == 's' ? &c->source_duration : &c->delivery_duration) = value;
+        return true;
+    }
+    if (!strcmp(key, "direct-file") && node->format == MPV_FORMAT_FLAG) {
+        c->direct_file = node->u.flag;
+        return true;
+    }
+    return false;
 }
 
 static int mp_property_curl_transport_control(void *ctx,
@@ -1858,20 +1899,24 @@ static int mp_property_curl_transport_control(void *ctx,
     if (action != M_PROPERTY_SET)
         return M_PROPERTY_NOT_IMPLEMENTED;
     struct mpv_node *map = arg;
-    double bitrate, buffer;
-    struct mpv_node *paused = node_map_get(map, "paused");
-    struct mpv_node *generation = node_map_get(map, "buffer-generation");
-    if (!curl_control_number(map, "media-bitrate", &bitrate) ||
-        !curl_control_number(map, "buffer-seconds", &buffer) ||
-        !paused || paused->format != MPV_FORMAT_FLAG ||
-        (generation && (generation->format != MPV_FORMAT_INT64 ||
-                        generation->u.int64 < 0)))
+    if (map->format != MPV_FORMAT_NODE_MAP)
+        return M_PROPERTY_ERROR;
+    struct mpv_node *format = node_map_get(map, "format");
+    struct mpv_node *op = node_map_get(map, "op");
+    if (!format || !op || op->format != MPV_FORMAT_INT64 ||
+        (op->u.int64 != 0 && op->u.int64 != 1) ||
+        !node_map_get(map, "playback-epoch"))
     {
         return M_PROPERTY_ERROR;
     }
-    mp_curl_set_control(mpctx->global, bitrate, buffer, paused->u.flag,
-                        generation ? generation->u.int64 : 0);
-    return M_PROPERTY_OK;
+    struct mp_curl_control control = { .op = op->u.int64 };
+    for (int n = 0; n < map->u.list->num; n++) {
+        if (!curl_control_field(&map->u.list->values[n], map->u.list->keys[n],
+                                &control))
+            return M_PROPERTY_ERROR;
+    }
+    return mp_curl_set_control(mpctx->global, &control)
+        ? M_PROPERTY_OK : M_PROPERTY_ERROR;
 }
 #endif
 

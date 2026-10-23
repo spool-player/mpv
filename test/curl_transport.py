@@ -148,10 +148,16 @@ class Player:
     def set(self, name, value):
         self.check(self.lib.mpv_set_property_string(self.handle, name.encode(), str(value).encode()), name)
 
-    def control(self, bitrate=0, buffer=0, paused=False):
+    def transport_control(self, values):
+        # Returns libmpv's result: tests assert rejections as well as success.
         keep = []
-        node = encode({"media-bitrate": bitrate, "buffer-seconds": buffer, "paused": paused}, keep)
-        self.check(self.lib.mpv_set_property(self.handle, b"curl-transport-control", 6, C.byref(node)), "control")
+        node = encode(values, keep)
+        return self.lib.mpv_set_property(self.handle, b"curl-transport-control", 6, C.byref(node))
+
+    def configure(self, epoch, **facts):
+        self.check(self.transport_control({"format": 2, "op": 0, "playback-epoch": epoch,
+                                           **{key.replace("_", "-"): value for key, value in facts.items()}}),
+                   "configure")
 
     def play(self, url, loaded=None, timeout=90):
         started = time.monotonic()
@@ -373,7 +379,6 @@ class CurlTransport(unittest.TestCase):
             observed = {}
 
             def pause_seek_resume(current):
-                current.control(paused=True)
                 time.sleep(2.5)
                 settled = current.get("curl-transport-metrics")
                 time.sleep(1.25)
@@ -391,7 +396,6 @@ class CurlTransport(unittest.TestCase):
                                          idle["curl-thread-wall-seconds"])
                 observed["before-seek"] = idle["received-bytes"]
                 current.command("seek", "2", "absolute+exact")
-                current.control(paused=False)
                 current.set("pause", "no")
 
             try:
@@ -591,6 +595,55 @@ class CurlTransport(unittest.TestCase):
         if flags:
             self.assertEqual(metrics["hw-aes"], int("aes" in flags[1].split()))
 
+    def test_transport_control_epochs_facts_and_background_traffic(self):
+        # Configure installs one playback's facts under a newer epoch; stale
+        # or malformed controls change nothing. Background host traffic makes
+        # capacity evidence invalid while it lasts.
+        with Origin(size=8 << 20, latency=0.02, per_lane=256 << 10) as origin:
+            player = Player(LIBRARY, **{"ao-null-untimed": "no", "curl-initial-requests": "4",
+                                       "curl-startup-requests": "4"})
+            checks = {}
+
+            def control(current):
+                # 20 Mbit/s from delivered size over duration, well above the
+                # WAV's measured 1.5 Mbit/s: demand follows the larger.
+                current.configure(5, delivery_size_bytes=25000000, delivery_duration_seconds=10.0)
+                checks["duplicate"] = current.transport_control(
+                    {"format": 2, "op": 0, "playback-epoch": 5,
+                     "delivery-size-bytes": 25000000, "delivery-duration-seconds": 10.0})
+                checks["conflict"] = current.transport_control(
+                    {"format": 2, "op": 0, "playback-epoch": 5, "delivery-bitrate": 1.0})
+                checks["stale"] = current.transport_control(
+                    {"format": 2, "op": 0, "playback-epoch": 4, "delivery-bitrate": 9e9})
+                for bad in ({"format": 1, "op": 0, "playback-epoch": 6},
+                            {"format": 2, "op": 0, "playback-epoch": 6, "media-bitrate": 1.0},
+                            {"format": 2, "op": 0, "playback-epoch": 0},
+                            {"format": 2, "op": 0, "playback-epoch": 6, "delivery-size-bytes": -1},
+                            {"format": 2, "op": 1, "playback-epoch": 5, "delivery-bitrate": 1.0}):
+                    checks.setdefault("malformed", []).append(current.transport_control(bad))
+                checks["after"] = current.get("curl-transport-metrics")
+                self.assertGreaterEqual(current.transport_control(
+                    {"format": 2, "op": 1, "playback-epoch": 5, "background-network": True}), 0)
+
+            try:
+                result = player.play(origin.url, loaded=control)
+            finally:
+                player.close()
+            self.assertGreaterEqual(checks["duplicate"], 0)
+            self.assertLess(checks["conflict"], 0)
+            self.assertGreaterEqual(checks["stale"], 0)
+            self.assertTrue(all(code < 0 for code in checks["malformed"]))
+            after = checks["after"]
+            self.assertEqual(after["playback-epoch"], 5)
+            self.assertEqual(after["stale-controls"], 1)
+            self.assertEqual(after["rejected-controls"], 1)
+            self.assertAlmostEqual(after["declared-bits-per-second"], 20e6, delta=1)
+            self.assertAlmostEqual(after["playback-demand-bits-per-second"], 20e6, delta=1)
+            metrics = result["metrics"]
+            self.assertTrue(metrics["background-network"])
+            # Throughout background traffic no capacity sample is accepted.
+            self.assertEqual(metrics["capacity-samples"], after["capacity-samples"])
+
     def test_cores_share_tls_sessions(self):
         # Every playback starts a new core. A second core must resume the
         # first core's TLS session instead of a full handshake, while each
@@ -732,7 +785,7 @@ class CurlTransport(unittest.TestCase):
                                        "curl-media-bitrate": "1536000"})
             try:
                 result = player.play(origin.url,
-                    loaded=lambda current: current.control(bitrate=1536000, buffer=5))
+                    loaded=lambda current: current.configure(1, delivery_bitrate=1536000.0))
                 metrics = result["metrics"]
                 points = metrics["concurrency-samples"]
                 self.assertGreater(metrics["capacity-samples"], 0)

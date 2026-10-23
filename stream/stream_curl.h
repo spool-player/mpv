@@ -108,6 +108,9 @@ struct mp_curl_metrics {
     int64_t max_socket_receive_buffer;
     int64_t host_rmem_max, host_autotune_max;
     int hw_aes;
+    int64_t playback_epoch, stale_controls, rejected_controls;
+    bool background_network;
+    double declared_bitrate; // bits/s demand prior from configured facts
     // Playback state as the transport sees it.
     int64_t playback_state_updates; // player reports received
     double playback_buffer_seconds;
@@ -128,10 +131,25 @@ struct mp_curl_metrics {
 bool mp_curl_get_metrics(struct mpv_global *global,
                          struct mp_curl_metrics *metrics);
 
-// Playback feedback is independent of the lifetime accounting. Bitrate is bits/s.
-void mp_curl_set_control(struct mpv_global *global, double media_bitrate,
-                         double buffer_seconds, bool paused,
-                         int64_t buffer_generation);
+// Host transport control (curl-transport-control, format 2). A configure
+// installs one playback's media facts under a strictly newer epoch; an update
+// changes live host state for the current epoch only. Facts <= 0 are unknown.
+struct mp_curl_control {
+    int op; // 0 configure, 1 update
+    int64_t epoch; // > 0
+    // op 0. Bitrates are bits/s, sizes bytes, durations seconds.
+    double source_bitrate, delivery_bitrate;
+    int64_t source_size, delivery_size;
+    double source_duration, delivery_duration;
+    bool direct_file; // delivered bytes are the original file
+    // op 1: the host is fetching other data from the network (e.g. previews).
+    bool background_network;
+};
+
+// False when a configure conflicts with the installed one for its epoch.
+// Older epochs and updates for another epoch are ignored and counted.
+bool mp_curl_set_control(struct mpv_global *global,
+                         const struct mp_curl_control *control);
 
 // Open `url` via mpv's libcurl backend and wrap it as a fresh AVIOContext.
 // On success returns 0, fills *pb_out with the new context, and sets *data to

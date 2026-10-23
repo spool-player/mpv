@@ -1747,6 +1747,90 @@ static int mp_property_curl_transport_metrics(void *ctx,
     node_map_add_int64(result, "failed-requests", metrics.failed_requests);
     node_map_add_int64(result, "retry-attempts", metrics.retry_attempts);
     node_map_add_int64(result, "received-bytes", metrics.received_bytes);
+    node_map_add_int64(result, "ordered-available-bytes", metrics.ordered_available_bytes);
+    node_map_add_int64(result, "consumer-delivered-bytes", metrics.consumer_delivered_bytes);
+    node_map_add_int64(result, "readable-bytes", metrics.readable_bytes);
+    node_map_add_int64(result, "retained-bytes", metrics.retained_bytes);
+    node_map_add_int64(result, "reorder-bytes", metrics.reorder_bytes);
+    node_map_add_int64(result, "copy-in-bytes", metrics.copy_in_bytes);
+    node_map_add_int64(result, "copy-out-bytes", metrics.copy_out_bytes);
+    node_map_add_int64(result, "reorder-copy-bytes", metrics.reorder_copy_bytes);
+    node_map_add_int64(result, "body-callbacks", metrics.body_callbacks);
+    node_map_add_int64(result, "worker-iterations", metrics.worker_iterations);
+    node_map_add_int64(result, "coalesced-wakeups", metrics.coalesced_wakeups);
+    node_map_add_int64(result, "head-of-line-events", metrics.head_of_line_events);
+    node_map_add_double(result, "reorder-wait-seconds", metrics.reorder_wait_seconds);
+    node_map_add_double(result, "oldest-gap-seconds", metrics.oldest_gap_seconds);
+    node_map_add_double(result, "perform-wall-seconds", metrics.perform_wall_seconds);
+    node_map_add_double(result, "dispatch-wall-seconds", metrics.dispatch_wall_seconds);
+    node_map_add_double(result, "poll-wall-seconds", metrics.poll_wall_seconds);
+    node_map_add_flag(result, "callback-time-included", metrics.callback_time_included);
+    node_map_add_flag(result, "snapshot-truncated", metrics.snapshot_truncated);
+    const char *available_counters[] = {
+        "received-bytes-available",
+        "ordered-available-bytes-available",
+        "consumer-delivered-bytes-available",
+        "readable-bytes-available",
+        "retained-bytes-available",
+        "reorder-bytes-available",
+        "peak-reorder-bytes-available",
+        "copy-in-bytes-available",
+        "copy-out-bytes-available",
+        "reorder-copy-bytes-available",
+        "body-callbacks-available",
+        "worker-iterations-available",
+        "coalesced-wakeups-available",
+        "head-of-line-events-available",
+        "head-of-line-seconds-available",
+        "reorder-wait-seconds-available",
+        "oldest-gap-seconds-available",
+        "perform-wall-seconds-available",
+        "dispatch-wall-seconds-available",
+        "poll-wall-seconds-available",
+        "ring-wait-seconds-available",
+        "consumer-wait-seconds-available",
+    };
+    for (int n = 0; n < MP_ARRAY_SIZE(available_counters); n++)
+        node_map_add_flag(result, available_counters[n], true);
+    struct mpv_node *streams = node_map_add(result, "streams", MPV_FORMAT_NODE_ARRAY);
+    for (int n = 0; n < metrics.num_streams; n++) {
+        struct mp_curl_stream_metrics *stream = &metrics.streams[n];
+        struct mpv_node *entry = node_array_add(streams, MPV_FORMAT_NODE_MAP);
+        node_map_add_int64(entry, "stream-id", stream->id);
+        node_map_add_int64(entry, "readable-bytes", stream->readable_bytes);
+        node_map_add_int64(entry, "retained-bytes", stream->retained_bytes);
+        node_map_add_int64(entry, "reorder-bytes", stream->reorder_bytes);
+    }
+    struct mpv_node *connections = node_map_add(result, "connections", MPV_FORMAT_NODE_ARRAY);
+    for (int n = 0; n < metrics.num_connections; n++) {
+        struct mp_curl_connection_metrics *connection = &metrics.connections[n];
+        struct mpv_node *entry = node_array_add(connections, MPV_FORMAT_NODE_MAP);
+        node_map_add_int64(entry, "connection-id", connection->id);
+        node_map_add_int64(entry, "socket-generation", connection->socket_generation);
+        node_map_add_int64(entry, "http-version", connection->http_version);
+        node_map_add_int64(entry, "transport", connection->transport);
+        node_map_add_int64(entry, "active-requests", connection->active_requests);
+        node_map_add_int64(entry, "socket-receive-buffer-bytes", connection->receive_buffer);
+        node_map_add_flag(entry, "socket-receive-buffer-available", connection->receive_buffer >= 0);
+        node_map_add_int64(entry, "receive-window-bytes", connection->receive_window);
+        node_map_add_flag(entry, "receive-window-available", connection->receive_window >= 0);
+        node_map_add_double(entry, "tcp-rtt-ms", connection->rtt_ms);
+        node_map_add_flag(entry, "tcp-rtt-available", connection->rtt_ms >= 0);
+        node_map_add_flag(entry, "http-version-available", connection->http_version != 0);
+        node_map_add_flag(entry, "socket-generation-available", connection->socket_generation != 0);
+        node_map_add_flag(entry, "transport-available", connection->transport != 0);
+    }
+    node_map_add_double(result, "streams-per-connection", metrics.streams_per_connection);
+    node_map_add_flag(result, "streams-per-connection-available", metrics.physical_connections > 0);
+    struct mpv_node *protocols = node_map_add(result, "protocol-samples", MPV_FORMAT_NODE_ARRAY);
+    for (int n = 0; n < MP_ARRAY_SIZE(metrics.protocols); n++) {
+        struct mp_curl_protocol_metrics *protocol = &metrics.protocols[n];
+        struct mpv_node *entry = node_array_add(protocols, MPV_FORMAT_NODE_MAP);
+        node_map_add_int64(entry, "http-version", protocol->http_version);
+        node_map_add_int64(entry, "ordered-available-bytes", protocol->ordered_bytes);
+        node_map_add_double(entry, "cpu-ns-per-ordered-byte", protocol->cpu_ns_per_ordered_byte);
+        node_map_add_flag(entry, "cpu-ns-per-ordered-byte-available", protocol->cpu_available);
+    }
     node_map_add_int64(result, "average-received-bytes-per-second",
                        metrics.average_received_bytes_per_second);
     node_map_add_int64(result, "peak-received-bytes-per-second",
@@ -1797,7 +1881,7 @@ static int mp_property_curl_transport_metrics(void *ctx,
     node_map_add_flag(result, "playback-user-paused",
                       metrics.playback_user_paused);
     node_map_add_int64(result, "selected-requests", metrics.selected_requests);
-    node_map_add_double(result, "latency-ms", metrics.latency_ms);
+    node_map_add_double(result, "ttfb-ms", metrics.ttfb_ms);
     node_map_add_int64(result, "capacity-bytes-per-second",
                        metrics.capacity_bytes_per_second);
     node_map_add_int64(result, "capacity-samples", metrics.capacity_samples);
@@ -1829,7 +1913,7 @@ static int mp_property_curl_transport_metrics(void *ctx,
             node_map_add_int64(entry, "requests", n + 1);
             node_map_add_int64(entry, "capacity-bytes-per-second",
                                point->capacity_bytes_per_second);
-            node_map_add_double(entry, "latency-ms", point->latency_ms);
+            node_map_add_double(entry, "ttfb-ms", point->ttfb_ms);
             node_map_add_int64(entry, "samples", point->samples);
         }
     }

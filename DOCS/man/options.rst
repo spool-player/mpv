@@ -6114,7 +6114,7 @@ TLS/connection diagnostics), set ``--msg-level=curl=trace``.
     Zero disables buffer-based completion. Without embedding-player feedback,
     only the byte budget is used.
 
-``--curl-latency-ms=<milliseconds>``
+``--curl-ttfb-ms=<milliseconds>``
     Learned request-to-first-body-byte estimate (default: 0, unknown). This
     includes DNS, connection/TLS setup and server/disk queueing; it is not a
     pure network RTT. Used to amortize request overhead within the range and

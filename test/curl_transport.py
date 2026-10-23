@@ -363,6 +363,19 @@ class CurlTransport(unittest.TestCase):
                 self.assertLessEqual(metrics["average-received-bytes-per-second"], wall_rate * 1.2)
                 self.assertGreater(metrics["average-received-bytes-per-second"], wall_rate * 0.8)
                 self.assertEqual(sum(lane["received-bytes"] for lane in metrics["lane-samples"]), metrics["received-bytes"])
+                self.assertGreater(metrics["consumer-delivered-bytes"], len(origin.pcm))
+                self.assertEqual(metrics["copy-out-bytes"], metrics["consumer-delivered-bytes"])
+                self.assertGreaterEqual(metrics["ordered-available-bytes"], metrics["consumer-delivered-bytes"])
+                self.assertGreaterEqual(metrics["received-bytes"], metrics["ordered-available-bytes"])
+                self.assertEqual(metrics["copy-in-bytes"], metrics["ordered-available-bytes"])
+                self.assertEqual(metrics["reorder-copy-bytes"], 0)
+                self.assertGreater(metrics["body-callbacks"], 0)
+                self.assertGreater(metrics["worker-iterations"], 0)
+                self.assertGreater(metrics["perform-wall-seconds"], 0)
+                self.assertGreater(metrics["poll-wall-seconds"], 0)
+                self.assertLessEqual(sum(metrics[key] for key in
+                    ("perform-wall-seconds", "dispatch-wall-seconds", "poll-wall-seconds")),
+                    metrics["curl-thread-wall-seconds"])
                 for lane in metrics["lane-samples"]:
                     expected = lane["received-bytes"] / lane["active-seconds"]
                     self.assertAlmostEqual(lane["average-bytes-per-second"], expected, delta=2)
@@ -407,7 +420,8 @@ class CurlTransport(unittest.TestCase):
                 self.assertGreater(second["received-bytes"], first["received-bytes"])
                 self.assertGreater(second["stream-id"], first["stream-id"])
                 for key in ("curl-thread-wall-seconds", "ring-wait-seconds",
-                            "consumer-wait-seconds"):
+                            "consumer-wait-seconds", "consumer-delivered-bytes", "ordered-available-bytes",
+                            "copy-in-bytes", "copy-out-bytes", "body-callbacks"):
                     self.assertGreaterEqual(second[key], first[key])
             finally:
                 player.close()
@@ -452,6 +466,25 @@ class CurlTransport(unittest.TestCase):
             self.assertGreater(metrics["head-of-line-seconds"], 1.0)
             self.assertLess(metrics["head-of-line-seconds"], metrics["consumer-wait-seconds"] + 0.01)
             self.assertGreater(metrics["peak-reorder-bytes"], mib)
+            self.assertGreater(metrics["head-of-line-events"], 0)
+            self.assertGreaterEqual(metrics["reorder-wait-seconds"], metrics["head-of-line-seconds"])
+            gaps = [sample for at, sample in result["samples"]
+                    if paused + 1.0 <= result["started"] + at <= resumed - 0.2
+                    and sample["reorder-bytes"] > 0]
+            self.assertGreaterEqual(len(gaps), 2)
+            self.assertGreater(gaps[-1]["oldest-gap-seconds"], gaps[0]["oldest-gap-seconds"])
+            self.assertGreater(gaps[-1]["reorder-wait-seconds"], gaps[0]["reorder-wait-seconds"])
+            for sample in gaps:
+                self.assertGreaterEqual(sample["retained-bytes"], sample["readable-bytes"] + sample["reorder-bytes"])
+                self.assertFalse(sample["snapshot-truncated"])
+                self.assertTrue(sample["streams"])
+                self.assertLessEqual(sum(row["active-requests"] for row in sample["connections"]),
+                                     sample["active-requests"])
+                for row in sample["connections"]:
+                    self.assertGreater(row["connection-id"], 0)
+                    self.assertGreater(row["socket-generation"], 0)
+                    self.assertEqual(row["http-version"], 11)
+                    self.assertEqual(row["transport"], 1)
             connections = [sample["physical-connections"] for _, sample in result["samples"]]
             self.assertGreaterEqual(max(connections), 2)
             self.assertLessEqual(max(connections), 4)
@@ -810,7 +843,7 @@ def benchmark(library):
             with Origin(**settings) as origin:
                 player = Player(library, **{"curl-initial-requests": lanes,
                                             "curl-startup-requests": lanes,
-                                            "curl-latency-ms": settings["latency"] * 1000,
+                                            "curl-ttfb-ms": settings["latency"] * 1000,
                                             "curl-media-bitrate": "12000000"})
                 try:
                     result = player.play(origin.url)

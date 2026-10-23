@@ -60,10 +60,33 @@ struct mp_curl_lane_metrics {
 };
 struct mp_curl_concurrency_metrics {
     int64_t capacity_bytes_per_second;
-    double latency_ms;
+    double ttfb_ms;
     int64_t samples;
 };
 
+#define MP_CURL_MAX_METRIC_STREAMS 64
+#define MP_CURL_MAX_METRIC_CONNECTIONS 64
+
+struct mp_curl_stream_metrics {
+    int64_t id;
+    int64_t readable_bytes, retained_bytes, reorder_bytes;
+};
+
+struct mp_curl_connection_metrics {
+    int64_t id, socket_generation; // opaque, never a descriptor/address
+    int http_version; // 0 unknown, 10, 11, 20, 30
+    int transport; // 0 unknown, 1 TCP, 2 UDP
+    int64_t active_requests;
+    int64_t receive_buffer, receive_window; // -1 unavailable
+    double rtt_ms; // -1 unavailable
+};
+
+struct mp_curl_protocol_metrics {
+    int http_version;
+    int64_t ordered_bytes;
+    double cpu_ns_per_ordered_byte;
+    bool cpu_available;
+};
 
 struct mp_curl_metrics {
     int64_t active_requests;
@@ -78,6 +101,20 @@ struct mp_curl_metrics {
     int64_t failed_requests;
     int64_t retry_attempts;
     int64_t received_bytes;
+    int64_t ordered_available_bytes, consumer_delivered_bytes;
+    int64_t readable_bytes, retained_bytes, reorder_bytes;
+    int64_t copy_in_bytes, copy_out_bytes, reorder_copy_bytes;
+    int64_t body_callbacks, worker_iterations, coalesced_wakeups;
+    int64_t head_of_line_events;
+    double reorder_wait_seconds, oldest_gap_seconds;
+    double perform_wall_seconds, dispatch_wall_seconds, poll_wall_seconds;
+    // Callback wall time is nested in perform (or dispatch on unpause).
+    bool callback_time_included;
+    bool snapshot_truncated;
+    int num_streams, num_connections;
+    struct mp_curl_stream_metrics streams[MP_CURL_MAX_METRIC_STREAMS];
+    struct mp_curl_connection_metrics connections[MP_CURL_MAX_METRIC_CONNECTIONS];
+    struct mp_curl_protocol_metrics protocols[3]; // HTTP/1.1, HTTP/2, HTTP/3
     int64_t average_received_bytes_per_second;
     int64_t peak_received_bytes_per_second;
     int64_t current_received_bytes_per_second;
@@ -86,9 +123,8 @@ struct mp_curl_metrics {
     double curl_thread_cpu_seconds;
     double curl_thread_wall_seconds;
     bool curl_thread_cpu_available;
-    // Summed wall time across streams (not CPU time). Consumer waits are
-    // accounted when the empty-ring wait completes; producer waits include
-    // currently blocked streams.
+    // Summed wall time across streams (not CPU time), including ongoing
+    // producer-full and consumer-empty intervals in every snapshot.
     double ring_wait_seconds;
     double consumer_wait_seconds;
     // Consumer wait while later queue bytes were already retained: the
@@ -96,6 +132,7 @@ struct mp_curl_metrics {
     double head_of_line_seconds;
     int64_t peak_reorder_bytes;     // retained bytes beyond the first gap
     int64_t physical_connections;   // distinct connections of active transfers
+    double streams_per_connection; // connected active requests / connections
     // Worker wake-up delay past its deadline: largest since the previous
     // snapshot, and for the worker's lifetime.
     double recent_lateness_ms;
@@ -117,7 +154,7 @@ struct mp_curl_metrics {
     double playback_demand_bitrate; // bits/s used as demand, 0 unknown
     bool playback_user_paused;
     int64_t selected_requests;
-    double latency_ms;
+    double ttfb_ms;
     int64_t capacity_bytes_per_second;
     int64_t capacity_samples;
     int64_t stream_id;

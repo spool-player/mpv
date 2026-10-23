@@ -2694,6 +2694,15 @@ Property list
         The byte, work, gap and scope counters have corresponding
         ``<field>-available`` flags.
 
+    ``consumer-thread-cpu-seconds``, ``consumer-thread-cpu-available``
+        Sampled cumulative CPU on threads which consume curl streams, including
+        demux/decode work on those threads, not just transport copies. Samples
+        are taken only on read/wait boundaries after a 250 ms deadline. Threads
+        shared by nested streams are counted once; totals survive stream close.
+        Failed/unsupported queries and a truncated thread registry are
+        unavailable, not measured zero. Apple uses Mach thread accounting when
+        pthread CPU clocks cannot answer; Windows accounting is unchanged.
+
     ``streams``, ``connections``, ``snapshot-truncated``
         Bounded arrays of at most 64 rows each. Stream rows contain opaque
         monotonic ``stream-id`` and current readable/retained/reorder gauges.
@@ -2703,6 +2712,8 @@ Property list
         immediate prefixes and ``If-Range`` suffix retries; changed or omitted
         validators cannot splice representations. Hidden bytes in the leading
         descriptor are not themselves reorder bytes.
+        Transient HTTP error bodies are rejected and retried within the normal
+        retry bound; their validators do not identify the media representation.
         Connection rows contain opaque ``connection-id``, monotonic
         ``socket-generation``, effective ``http-version`` (0 unknown,
         10/11/20/30), physical ``transport`` (0 unknown, 1 TCP, 2 UDP), and
@@ -2749,6 +2760,15 @@ Property list
         How late the curl worker woke past its own deadline: the largest delay
         since the previous read of this property, and for the core's lifetime.
         It is CPU scheduling delay, not network latency.
+
+    ``scheduling-lateness-p50-ms``, ``scheduling-lateness-p99-ms``,
+    ``scheduling-lateness-available``
+        Percentile upper bounds from the last completed one-second deadline
+        window. Only polls which reach their deadline contribute; early socket
+        wakeups are not late samples. A fixed power-of-two microsecond
+        histogram avoids allocation and sorting, so reported bounds can be up
+        to twice the observed delay. No samples means unavailable, not zero
+        scheduling jitter. These windows do not reset when metrics are read.
 
     ``open-sockets``, ``sockets-opened``, ``tcp-rtt-min-ms``, ``tcp-rtt-max-ms``, ``max-socket-receive-buffer-bytes``
         Sockets libcurl opened for this core, sampled every 500 ms on Linux,

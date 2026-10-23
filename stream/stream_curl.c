@@ -230,6 +230,18 @@ struct curl_socket_info {
     bool endpoints_valid;
 };
 
+// Read by consumers only at their sampling boundary, never body callbacks.
+// Deduplicate by thread: nested streams can share one demux reader thread.
+#define MP_CURL_MAX_CONSUMERS 64
+struct curl_consumer_cpu {
+    uint64_t generation;
+    unsigned users;
+    int64_t last_cpu_ns, total_ns, next_sample_ns;
+    bool valid;
+};
+static atomic_uint_fast64_t next_consumer_generation = 1;
+static _Thread_local uint64_t consumer_thread_generation;
+
 struct curl_ctx {
     mp_thread thread;
     struct mp_dispatch_queue *dispatch;
@@ -276,6 +288,10 @@ struct curl_ctx {
     int hw_aes;                 // 1 yes, 0 no, -1 unknown
     // Player state handed over without waiting for this thread.
     mp_mutex state_lock;
+    struct curl_consumer_cpu consumer_cpu[MP_CURL_MAX_CONSUMERS];
+    bool consumer_snapshot_truncated;
+    int64_t retired_consumer_cpu_ns;
+    bool consumer_cpu_seen, consumer_cpu_incomplete;
     struct mp_curl_playback_state pending_state;
     bool state_pending;
     // Applied on the curl thread. The player owns pause and buffer state;
@@ -292,6 +308,12 @@ struct curl_ctx {
     // last metrics snapshot. Both owned by the curl thread.
     atomic_int_fast64_t recent_lateness_ns;
     int64_t peak_lateness_ns;
+    // 0 then power-of-two microsecond upper bounds; no allocation/sorting.
+    uint64_t lateness_bins[32], lateness_samples;
+    int64_t next_lateness_window_ns;
+    int64_t lateness_window_max_ns;
+    double lateness_p50_ms, lateness_p99_ms;
+    bool lateness_available;
     struct curl_rate lanes[MP_CURL_MAX_LANES];
     int64_t lane_capacity[MP_CURL_MAX_LANES];
     int64_t lane_samples[MP_CURL_MAX_LANES];
@@ -468,6 +490,8 @@ struct priv {
     uint64_t queue_pos;  // next queue byte the consumer reads
     bool queue_open;     // the ring holds nothing before the queue
     bool consumer_waiting;
+    int64_t next_consumer_cpu_ns;
+    int consumer_cpu_slot; // index + 1, 0 unregistered; protected by state_lock
     int64_t consumer_wait_started_ns, consumer_wait_ns;
     int64_t gap_started_ns, gap_ns, hol_started_ns, hol_ns;
     uint64_t delivered_bytes, coalesced_wakeups, hol_events;
@@ -847,6 +871,23 @@ static void finish_curl_request(struct curl_ctx *ctx, bool succeeded)
                                   memory_order_relaxed);
 }
 
+// Caller holds state_lock. Retiring an identity preserves lifetime CPU while
+// freeing its slot; OS thread-ID reuse never joins unrelated CPU clocks.
+static void release_consumer_cpu(struct priv *p)
+{
+    if (!p->consumer_cpu_slot)
+        return;
+    struct curl_ctx *ctx = p->ctx;
+    struct curl_consumer_cpu *sample = &ctx->consumer_cpu[p->consumer_cpu_slot - 1];
+    p->consumer_cpu_slot = 0;
+    mp_assert(sample->users > 0);
+    if (--sample->users == 0) {
+        ctx->retired_consumer_cpu_ns += sample->total_ns;
+        ctx->consumer_cpu_incomplete |= !sample->valid;
+        *sample = (struct curl_consumer_cpu) { 0 };
+    }
+}
+
 static void register_curl_stream(struct priv *p)
 {
     p->metrics_registered = true;
@@ -902,6 +943,9 @@ static void run_cmd(void *arg)
         start_request(c->p);
         break;
     case CMD_REMOVE:
+        mp_mutex_lock(&ctx->state_lock);
+        release_consumer_cpu(c->p);
+        mp_mutex_unlock(&ctx->state_lock);
         end_ring_wait(c->p);
         stop_dynamic(c->p);
         if (c->p->active) {
@@ -1311,11 +1355,34 @@ static void sample_sockets(struct curl_ctx *ctx)
 // CPU clocks and rate scans run at most once per controller tick, never per
 // body chunk or metrics request. A shared worker cannot attribute a mixed-
 // protocol window, so those windows explicitly have no protocol CPU sample.
+static double lateness_percentile(struct curl_ctx *ctx, unsigned percent)
+{
+    uint64_t rank = (ctx->lateness_samples * percent + 99) / 100;
+    uint64_t count = 0;
+    int64_t upper_ns = 0;
+    for (int n = 0; n < MP_ARRAY_SIZE(ctx->lateness_bins); n++) {
+        count += ctx->lateness_bins[n];
+        if (count >= rank)
+            return MPMAX(upper_ns, n == MP_ARRAY_SIZE(ctx->lateness_bins) - 1 ? ctx->lateness_window_max_ns : 0) / 1e6;
+        upper_ns = n == 0 ? 1000 : upper_ns * 2;
+    }
+    return upper_ns / 1e6;
+}
+
 static void measurement_tick(struct curl_ctx *ctx, int64_t now)
 {
     if (now < ctx->next_tick_ns)
         return;
     ctx->next_tick_ns = now + RATE_BUCKET_NS;
+    if (now >= ctx->next_lateness_window_ns) {
+        ctx->lateness_available = ctx->lateness_samples > 0;
+        ctx->lateness_p50_ms = ctx->lateness_available ? lateness_percentile(ctx, 50) : 0;
+        ctx->lateness_p99_ms = ctx->lateness_available ? lateness_percentile(ctx, 99) : 0;
+        memset(ctx->lateness_bins, 0, sizeof(ctx->lateness_bins));
+        ctx->lateness_samples = 0;
+        ctx->lateness_window_max_ns = 0;
+        ctx->next_lateness_window_ns = now + MP_TIME_S_TO_NS(1);
+    }
     int64_t cpu = mp_thread_cpu_time_ns(mp_thread_current_id());
     ctx->thread_cpu_ns = cpu;
     bool available = ctx->last_cpu_ns >= 0 && cpu >= ctx->last_cpu_ns;
@@ -1352,6 +1419,7 @@ static MP_THREAD_VOID curl_thread(void *arg)
         mp_thread_cpu_time_ns(mp_thread_current_id());
     ctx->thread_cpu_ns = ctx->last_cpu_ns = ctx->thread_cpu_started_ns;
     ctx->next_tick_ns = ctx->thread_started_ns + RATE_BUCKET_NS;
+    ctx->next_lateness_window_ns = ctx->thread_started_ns + MP_TIME_S_TO_NS(1);
     probe_host_limits(ctx);
 
     CURLcode res = curl_global_init(CURL_GLOBAL_ALL);
@@ -1461,6 +1529,15 @@ static MP_THREAD_VOID curl_thread(void *arg)
         ctx->poll_ns += poll_end - poll_start;
         int64_t late = poll_end - deadline;
         if (!ready && late >= 0) {
+            int bucket = 0;
+            int64_t upper_ns = 0;
+            while (late > upper_ns && bucket < MP_ARRAY_SIZE(ctx->lateness_bins) - 1) {
+                upper_ns = bucket == 0 ? 1000 : upper_ns * 2;
+                bucket++;
+            }
+            ctx->lateness_bins[bucket]++;
+            ctx->lateness_samples++;
+            ctx->lateness_window_max_ns = MPMAX(ctx->lateness_window_max_ns, late);
             atomic_store_explicit(&ctx->recent_lateness_ns,
                 MPMAX(late, atomic_load_explicit(&ctx->recent_lateness_ns,
                                                  memory_order_relaxed)),
@@ -1634,12 +1711,26 @@ static void read_metrics(void *arg)
         .playback_user_paused = ctx->playback_paused,
         .recent_lateness_ms = atomic_exchange_explicit(&ctx->recent_lateness_ns, 0, memory_order_relaxed) / 1e6,
         .peak_lateness_ms = ctx->peak_lateness_ns / 1e6,
+        .lateness_p50_ms = ctx->lateness_p50_ms,
+        .lateness_p99_ms = ctx->lateness_p99_ms,
+        .lateness_available = ctx->lateness_available,
         .selected_requests = ctx->selected_requests,
         .ttfb_ms = ctx->ttfb_ms,
         .capacity_bytes_per_second = ctx->capacity,
         .capacity_samples = ctx->capacity_samples,
         .stream_id = ctx->stream_id,
     };
+    mp_mutex_lock(&ctx->state_lock);
+    metrics->consumer_cpu_seconds = MP_TIME_NS_TO_S(ctx->retired_consumer_cpu_ns);
+    metrics->consumer_cpu_available = ctx->consumer_cpu_seen && !ctx->consumer_cpu_incomplete;
+    for (int n = 0; n < MP_CURL_MAX_CONSUMERS; n++) {
+        if (!ctx->consumer_cpu[n].users)
+            continue;
+        metrics->consumer_cpu_seconds += MP_TIME_NS_TO_S(ctx->consumer_cpu[n].total_ns);
+        metrics->consumer_cpu_available &= ctx->consumer_cpu[n].valid;
+    }
+    metrics->snapshot_truncated |= ctx->consumer_snapshot_truncated;
+    mp_mutex_unlock(&ctx->state_lock);
     read_socket_metrics(ctx, metrics);
     read_connections(ctx, metrics);
     memcpy(metrics->protocols, ctx->protocol_metrics, sizeof(metrics->protocols));
@@ -2121,7 +2212,9 @@ static size_t dynamic_header_callback(char *buffer, size_t size, size_t nitems,
     // validator is known, its omission is not permission to splice bytes.
     const char *etag = header_value(request->curl, "ETag");
     bool same_entity = !p->etag || (etag && strcmp(etag, p->etag) == 0);
-    if (!same_entity || (resp == 200 && request->fetch_pos > 0))
+    // HTTP error documents may carry unrelated validators, or none. Reject
+    // their bodies but retain the bounded retry path for transient errors.
+    if ((resp == 200 || resp == 206) && (!same_entity || (resp == 200 && request->fetch_pos > 0)))
         request->changed = true;
     bool valid =
         resp == 206 &&
@@ -3314,11 +3407,63 @@ static void setup_curl(struct priv *p, CURL *c)
 
 // stream_curl implementation
 
+static void sample_consumer_cpu(struct priv *p)
+{
+    int64_t now = mp_time_ns();
+    if (now < p->next_consumer_cpu_ns)
+        return;
+    p->next_consumer_cpu_ns = now + RATE_BUCKET_NS;
+    struct curl_ctx *ctx = p->ctx;
+    if (!consumer_thread_generation)
+        consumer_thread_generation = atomic_fetch_add_explicit(&next_consumer_generation, 1, memory_order_relaxed);
+    mp_mutex_lock(&ctx->state_lock);
+    struct curl_consumer_cpu *sample = p->consumer_cpu_slot ? &ctx->consumer_cpu[p->consumer_cpu_slot - 1] : NULL;
+    if (sample && sample->generation != consumer_thread_generation) {
+        release_consumer_cpu(p);
+        sample = NULL;
+    }
+    if (!sample) {
+        struct curl_consumer_cpu *free_slot = NULL;
+        for (int n = 0; n < MP_CURL_MAX_CONSUMERS; n++) {
+            struct curl_consumer_cpu *slot = &ctx->consumer_cpu[n];
+            if (slot->users && slot->generation == consumer_thread_generation) {
+                sample = slot;
+                break;
+            }
+            if (!slot->users && !free_slot)
+                free_slot = slot;
+        }
+        if (!sample && free_slot) {
+            sample = free_slot;
+            *sample = (struct curl_consumer_cpu) { .generation = consumer_thread_generation, .last_cpu_ns = -1 };
+        }
+        if (sample) {
+            sample->users++;
+            p->consumer_cpu_slot = sample - ctx->consumer_cpu + 1;
+        }
+    }
+    if (!sample) {
+        ctx->consumer_snapshot_truncated = true;
+        ctx->consumer_cpu_incomplete = true;
+    } else if (now >= sample->next_sample_ns) {
+        int64_t cpu = mp_thread_cpu_time_ns(mp_thread_current_id());
+        sample->valid = cpu >= 0;
+        ctx->consumer_cpu_seen = true;
+        ctx->consumer_cpu_incomplete |= !sample->valid;
+        if (sample->valid && sample->last_cpu_ns >= 0 && cpu >= sample->last_cpu_ns)
+            sample->total_ns += cpu - sample->last_cpu_ns;
+        sample->last_cpu_ns = cpu;
+        sample->next_sample_ns = now + RATE_BUCKET_NS;
+    }
+    mp_mutex_unlock(&ctx->state_lock);
+}
+
 static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
 {
     struct priv *p = s->priv;
     if (max_len <= 0)
         return 0;
+    sample_consumer_cpu(p);
 
     mp_mutex_lock(&p->mtx);
 
@@ -3337,6 +3482,7 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
         p->consumer_wait_started_ns = 0;
         p->consumer_waiting = false;
         update_gap(p, now);
+        sample_consumer_cpu(p);
     }
 
     size_t copy = MPMIN((size_t)max_len, p->count);

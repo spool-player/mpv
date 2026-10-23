@@ -1845,6 +1845,8 @@ static int mp_property_curl_transport_metrics(void *ctx,
                         metrics.curl_thread_wall_seconds);
     node_map_add_flag(result, "curl-thread-cpu-available",
                       metrics.curl_thread_cpu_available);
+    node_map_add_double(result, "consumer-thread-cpu-seconds", metrics.consumer_cpu_seconds);
+    node_map_add_flag(result, "consumer-thread-cpu-available", metrics.consumer_cpu_available);
     node_map_add_double(result, "ring-wait-seconds", metrics.ring_wait_seconds);
     node_map_add_double(result, "consumer-wait-seconds",
                         metrics.consumer_wait_seconds);
@@ -1857,6 +1859,9 @@ static int mp_property_curl_transport_metrics(void *ctx,
                         metrics.recent_lateness_ms);
     node_map_add_double(result, "peak-scheduling-lateness-ms",
                         metrics.peak_lateness_ms);
+    node_map_add_double(result, "scheduling-lateness-p50-ms", metrics.lateness_p50_ms);
+    node_map_add_double(result, "scheduling-lateness-p99-ms", metrics.lateness_p99_ms);
+    node_map_add_flag(result, "scheduling-lateness-available", metrics.lateness_available);
     node_map_add_int64(result, "open-sockets", metrics.open_sockets);
     node_map_add_int64(result, "sockets-opened", metrics.sockets_opened);
     node_map_add_double(result, "tcp-rtt-min-ms", metrics.tcp_rtt_min_ms);

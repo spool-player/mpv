@@ -259,6 +259,12 @@ class Origin:
                 try:
                     with guard:
                         time.sleep(origin.latency + (0.1 if origin.reorder and start == 0 else 0))
+                        if inject and origin.fault == "unavailable":
+                            # A transient error document has no media validator.
+                            self.send_response(503)
+                            self.send_header("Content-Length", "0")
+                            self.end_headers()
+                            return
                         self.send_response(206 if match else 200)
                         self.send_header("Accept-Ranges", "bytes")
                         self.send_header("Content-Type", "audio/wav")
@@ -378,6 +384,10 @@ class CurlTransport(unittest.TestCase):
                 self.assertLessEqual(sum(metrics[key] for key in
                     ("perform-wall-seconds", "dispatch-wall-seconds", "poll-wall-seconds")),
                     metrics["curl-thread-wall-seconds"])
+                consumer_cpu = metrics["consumer-thread-cpu-seconds"]
+                self.assertGreaterEqual(consumer_cpu, 0)
+                if metrics["consumer-thread-cpu-available"]:
+                    self.assertGreater(consumer_cpu, 0)
                 for lane in metrics["lane-samples"]:
                     expected = lane["received-bytes"] / lane["active-seconds"]
                     self.assertAlmostEqual(lane["average-bytes-per-second"], expected, delta=2)
@@ -400,6 +410,9 @@ class CurlTransport(unittest.TestCase):
                 idle = current.get("curl-transport-metrics")
                 self.assertEqual(idle["received-bytes"], settled["received-bytes"])
                 self.assertEqual(idle["current-received-bytes-per-second"], 0)
+                self.assertTrue(idle["scheduling-lateness-available"])
+                self.assertGreaterEqual(idle["scheduling-lateness-p50-ms"], 0)
+                self.assertGreaterEqual(idle["scheduling-lateness-p99-ms"], idle["scheduling-lateness-p50-ms"])
                 self.assertGreater(idle["ring-wait-seconds"] -
                                    settled["ring-wait-seconds"], 1)
                 self.assertGreater(idle["curl-thread-wall-seconds"],
@@ -423,14 +436,15 @@ class CurlTransport(unittest.TestCase):
                 self.assertGreater(second["stream-id"], first["stream-id"])
                 for key in ("curl-thread-wall-seconds", "ring-wait-seconds",
                             "consumer-wait-seconds", "consumer-delivered-bytes", "ordered-available-bytes",
-                            "copy-in-bytes", "copy-out-bytes", "body-callbacks"):
+                            "copy-in-bytes", "copy-out-bytes", "body-callbacks", "consumer-thread-cpu-seconds"):
                     self.assertGreaterEqual(second[key], first[key])
             finally:
                 player.close()
 
     def test_invalid_and_truncated_ranges_preserve_pcm(self):
-        for fault in ("range", "truncate"):
-            with self.subTest(fault=fault), Origin(size=2 << 20, fault=fault) as origin, tempfile.TemporaryDirectory() as directory:
+        for fault in ("range", "truncate", "unavailable"):
+            with self.subTest(fault=fault), Origin(size=2 << 20, fault=fault,
+                    etag='"v1"' if fault == "unavailable" else None) as origin, tempfile.TemporaryDirectory() as directory:
                 output = pathlib.Path(directory) / "actual.pcm"
                 player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
                                            "ao-pcm-waveheader": "no", "audio-format": "s16",

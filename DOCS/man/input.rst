@@ -2659,6 +2659,55 @@ Property list
         Peak is the largest such full window, never a short-window average;
         it remains zero until a full second has elapsed. All rates are bytes/s.
 
+    ``ordered-available-bytes``, ``consumer-delivered-bytes``,
+    ``readable-bytes``, ``retained-bytes``, ``reorder-bytes``
+        Lifetime publication and consumer-copy totals, followed by current
+        queue gauges. Ordered bytes count newly validated contiguous prefixes,
+        not later retained ranges or retry overlap. Seeks/refetches can publish
+        bytes again. Consumer delivery includes format probing and seeking, not
+        just decoded media. Retained bytes are occupied transport storage, not
+        reserved capacity; readable bytes exclude a queue behind the primary
+        request. Reorder bytes are retained beyond the first queue gap.
+
+    ``copy-in-bytes``, ``copy-out-bytes``, ``reorder-copy-bytes``,
+    ``body-callbacks``, ``worker-iterations``, ``coalesced-wakeups``
+        Lifetime instrumentation of transport-owned copies and work. Copy-in
+        counts actual ring/queue writes (not ICY metadata or retry comparisons),
+        copy-out counts delivery to the reader. The ordered queue has no
+        intermediate reorder copy. Callbacks include paused replays; received
+        bytes do not. Coalesced wakeups count redundant consumer service
+        requests suppressed while one is pending.
+
+    ``perform-wall-seconds``, ``dispatch-wall-seconds``, ``poll-wall-seconds``
+        Disjoint worker wall-time scopes: libcurl perform, queued commands and
+        completed-transfer handling, and libcurl polling. Callback execution
+        is included in perform, or dispatch for an unpause callback
+        (``callback-time-included``); these are not CPU-time measurements.
+        Producer-full and consumer-empty wait totals include ongoing waits.
+        The byte, work, gap and scope counters have corresponding
+        ``<field>-available`` flags.
+
+    ``streams``, ``connections``, ``snapshot-truncated``
+        Bounded arrays of at most 64 rows each. Stream rows contain opaque
+        monotonic ``stream-id`` and current readable/retained/reorder gauges.
+        Connection rows contain opaque ``connection-id``, monotonic
+        ``socket-generation``, effective ``http-version`` (0 unknown,
+        10/11/20/30), physical ``transport`` (0 unknown, 1 TCP, 2 UDP), and
+        ``active-requests``. Multiplexed requests share a connection row.
+        ``streams-per-connection`` is the connected active request count
+        divided by physical connections, available only with a connection.
+        Socket receive-buffer, receive-window and kernel TCP RTT fields have
+        individual availability flags; -1 is unavailable. No descriptor,
+        endpoint or request URL is exported. Truncation loses observations,
+        never limits playback or aggregate byte/request counters.
+
+    ``protocol-samples``
+        HTTP/1.1, HTTP/2 and HTTP/3 ordered byte totals and
+        ``cpu-ns-per-ordered-byte`` with an availability flag. Worker CPU and
+        ordered bytes use the same 250 ms window. Mixed/unknown protocol
+        windows, empty windows and failed CPU queries are unavailable: a shared
+        worker cannot precisely attribute CPU to individual streams.
+
     ``active-requests``, ``peak-active-requests``, ``active-streams``,
     ``peak-active-streams``, ``started-requests``, ``finished-requests``,
     ``failed-requests``, ``retry-attempts``
@@ -2677,6 +2726,11 @@ Property list
         most retained data past the first missing byte. Physical connections
         counts distinct connections under the active transfers when sampled;
         multiplexed HTTP/2 streams share one.
+        ``reorder-wait-seconds`` counts the gap's union time even without
+        consumer demand; ``head-of-line-events`` counts demanded-gap entries.
+        ``oldest-gap-seconds`` is the oldest currently open gap. Wait totals
+        sum per-stream intervals, including ongoing intervals; full-cache
+        backpressure is not a gap.
 
     ``recent-scheduling-lateness-ms``, ``peak-scheduling-lateness-ms``
         How late the curl worker woke past its own deadline: the largest delay
@@ -2684,12 +2738,16 @@ Property list
         It is CPU scheduling delay, not network latency.
 
     ``open-sockets``, ``sockets-opened``, ``tcp-rtt-min-ms``, ``tcp-rtt-max-ms``, ``max-socket-receive-buffer-bytes``
-        Sockets libcurl opened for this core, sampled every 500 ms on Linux
-        and Apple platforms (unavailable elsewhere). RTT is the kernel's
+        Sockets libcurl opened for this core, sampled every 500 ms on Linux,
+        Apple and Windows platforms. RTT is the kernel's
         smoothed TCP round-trip time across open TCP sockets, not request
         time-to-first-byte; the receive buffer is the effective ``SO_RCVBUF``
         read-back, which is socket accounting, not the advertised window. -1
         means unavailable.
+        Windows uses unprivileged ``SIO_TCP_INFO`` version 0 when its SDK
+        exposes it; receive window and receive buffer are independently
+        available only when returned by the kernel. Other unsupported probes
+        remain unavailable, never synthesized as zero.
 
     ``host-rmem-max-bytes``, ``host-receive-autotune-max-bytes``, ``hw-aes``
         The unprivileged ``SO_RCVBUF`` ceiling and the receive-autotuning
@@ -2707,7 +2765,7 @@ Property list
         the player reports, ``curl-transport-control`` supplies only that
         bitrate prior, and its buffer and pause fields are ignored.
 
-    ``stream-id``, ``latency-ms``, ``capacity-bytes-per-second``, ``capacity-samples``
+    ``stream-id``, ``ttfb-ms``, ``capacity-bytes-per-second``, ``capacity-samples``
         Monotonic identity of the latest opened stream, estimated first-byte
         latency, and latest eligible capacity estimate/sample count. Capacity
         data resets on a new stream; lifetime traffic does not. The latest
@@ -2728,7 +2786,7 @@ Property list
 
     ``concurrency-samples``
         Array of actually measured operating points, each containing
-        ``requests`` (1-16), ``capacity-bytes-per-second``, ``latency-ms`` and
+        ``requests`` (1-16), ``capacity-bytes-per-second``, ``ttfb-ms`` and
         ``samples``. Uses eligible aggregate active wall time, including TTFB
         and server stalls, but excluding intentional idle/backpressure. These
         are measurements, not a curve extrapolated from individual lane rates.

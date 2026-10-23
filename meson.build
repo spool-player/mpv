@@ -680,7 +680,7 @@ if darwin
     subdir(join_paths('TOOLS', 'osxbundle'))
 endif
 
-libcurl = dependency('libcurl', version: '>= 8.4.0',
+libcurl = dependency('libcurl', version: '>= 8.2.0',
                      static: get_option('starfish').enabled(),
                      required: get_option('libcurl'))
 features += {'libcurl': libcurl.found()}

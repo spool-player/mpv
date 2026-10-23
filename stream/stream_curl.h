@@ -74,6 +74,15 @@ struct mp_curl_metrics {
     // currently blocked streams.
     double ring_wait_seconds;
     double consumer_wait_seconds;
+    // Consumer wait while later queue bytes were already retained: the
+    // cost of ordered delivery, not of the network as a whole.
+    double head_of_line_seconds;
+    int64_t peak_reorder_bytes;     // retained bytes beyond the first gap
+    int64_t physical_connections;   // distinct connections of active transfers
+    // Worker wake-up delay past its deadline: largest since the previous
+    // snapshot, and for the worker's lifetime.
+    double recent_lateness_ms;
+    double peak_lateness_ms;
     int64_t selected_requests;
     double latency_ms;
     int64_t capacity_bytes_per_second;

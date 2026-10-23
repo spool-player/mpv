@@ -83,6 +83,7 @@ struct curl_opts {
     int max_retries;
     double connect_timeout;
     int64_t buffer_size;
+    int64_t read_size;
     int64_t max_request_size;
     int parallel_requests;
     bool adaptive;
@@ -124,6 +125,8 @@ const struct m_sub_options curl_conf = {
         {"connect-timeout", OPT_DOUBLE(connect_timeout), M_RANGE(0, 600)},
         {"buffer-size", OPT_BYTE_SIZE(buffer_size),
             M_RANGE(2 * CURL_MAX_WRITE_SIZE, M_MAX_MEM_BYTES)},
+        {"read-size", OPT_BYTE_SIZE(read_size),
+            M_RANGE(CURL_MAX_WRITE_SIZE, CURL_MAX_READ_SIZE)},
         {"max-request-size", OPT_BYTE_SIZE(max_request_size),
             M_RANGE(0, M_MAX_MEM_BYTES)},
         {"parallel-requests", OPT_INT(parallel_requests), M_RANGE(1, 16)},
@@ -146,6 +149,7 @@ const struct m_sub_options curl_conf = {
         .max_retries = 5,
         .connect_timeout = 30,
         .buffer_size = 4 << 20, // 4 MiB
+        .read_size = 256 << 10,
         .max_request_size = 0,
         .parallel_requests = 1,
         .adaptive = true,
@@ -185,6 +189,7 @@ struct curl_ctx {
     mp_thread thread;
     struct mp_dispatch_queue *dispatch;
     CURLM *multi;
+    CURLSH *share; // process-wide; NULL if it could not be created
     bool exit;
 
     // Set when libcurl cannot be used anymore.
@@ -206,6 +211,12 @@ struct curl_ctx {
     int64_t thread_cpu_started_ns;
     struct curl_rate ring_wait;
     atomic_int_fast64_t consumer_wait_ns;
+    atomic_int_fast64_t head_of_line_ns;
+    atomic_int_fast64_t peak_reorder_bytes;
+    // Worker wake-up lateness past its own deadline; recent is since the
+    // last metrics snapshot. Both owned by the curl thread.
+    atomic_int_fast64_t recent_lateness_ns;
+    int64_t peak_lateness_ns;
     struct curl_rate lanes[MP_CURL_MAX_LANES];
     int64_t lane_capacity[MP_CURL_MAX_LANES];
     int64_t lane_samples[MP_CURL_MAX_LANES];
@@ -245,19 +256,34 @@ struct curl_handle_ref {
     uint64_t generation;
 };
 
+#define MP_CURL_MAX_RANGES 32
+
+// One ordered byte range of the parallel queue. Its storage belongs to the
+// range until the consumer has read every byte of it, so a retry can verify
+// already published bytes and a later range can never overwrite them.
+struct range_desc {
+    uint64_t start, end;  // absolute [start, end)
+    uint8_t *data;        // end - start bytes, fixed per queue entry
+    // Curl thread only.
+    size_t received;      // contiguous bytes stored from start
+    struct dynamic_request *request; // transfer filling it, NULL if none
+    int retry_count;
+    // Protected by priv.mtx.
+    size_t published;     // bytes the consumer may read, <= received
+    size_t consumed;      // bytes the consumer has taken
+    bool complete;        // every byte is published
+};
+
+// A network transfer slot. Slots are independent of range storage, so a
+// finished transfer can start the next range while its bytes wait to be read.
 struct dynamic_request {
     struct curl_handle_ref ref;
     CURL *curl;
-    uint8_t *data;
-    size_t size;
-    size_t consumed;
-    uint64_t start;
-    uint64_t end;
-    int retry_count;
+    struct range_desc *range; // range being fetched, NULL when idle
+    size_t fetch_pos;         // next offset in range this transfer writes
     bool active;
-    bool scheduled;
-    bool ready;
     bool response_ok;
+    bool changed;             // retried bytes differ from published bytes
 };
 
 // Per-stream state, owned by the curl thread.
@@ -293,11 +319,15 @@ struct priv {
     bool reply_ranged;         // current response is a 206 byte range
     bool reply_eof;            // current response marks the end of the file
 
-    // Parallel ranged prefetch. Requests fill private segment buffers and are
-    // appended to the shared ring in byte order after the primary request.
+    // Parallel ranged prefetch. Transfers write straight into an ordered
+    // queue of ranges after the primary request; the consumer reads the
+    // queue once the ring holds nothing earlier.
     struct dynamic_request *requests;
-    uint8_t *request_data;
     int num_requests;
+    struct range_desc *ranges; // circular queue, num_ranges entries
+    uint8_t *range_data;
+    int num_ranges;
+    char *etag;                // strong validator of the primary response
     uint64_t primary_end;
     uint64_t next_schedule;
     bool dynamic_started;
@@ -345,7 +375,16 @@ struct priv {
     size_t buffer_size;
     size_t head, tail, count;
     bool paused;         // write callback paused due to a full buffer
-    bool dynamic_waiting; // completed ordered range is blocked on ring space
+    int range_head;      // oldest queued range
+    int range_count;     // queued ranges, read or not
+    uint64_t ordered_pos; // end of the contiguous published queue prefix
+    uint64_t queued_bytes; // published queue bytes not yet consumed
+    uint64_t queue_pos;  // next queue byte the consumer reads
+    bool queue_open;     // the ring holds nothing before the queue
+    bool consumer_waiting;
+    bool copying;        // consumer is copying queue bytes unlocked
+    bool copy_waiter;    // curl thread waits for that copy to finish
+    bool service_pending; // a CMD_PUMP is queued for the curl thread
     bool stream_eof;     // producer has delivered all data
     bool stream_error;   // unrecoverable error
     atomic_bool aborted; // canceled by user (mp_cancel)
@@ -376,7 +415,8 @@ struct cmd {
 static void start_request(struct priv *p);
 static void on_done(struct priv *p, CURLcode code);
 static void start_dynamic(struct priv *p);
-static void pump_dynamic(struct priv *p);
+static void fill_dynamic(struct priv *p);
+static void open_queue(struct priv *p);
 static void stop_dynamic(struct priv *p);
 static void on_dynamic_done(struct dynamic_request *request, CURLcode code);
 static void fallback_dynamic(struct priv *p);
@@ -543,6 +583,10 @@ static void setup_curl(struct priv *p, CURL *curl);
 
 static CURLMcode add_curl_handle(struct curl_ctx *ctx, CURL *handle)
 {
+    // Attached here, on the curl thread, while the handle is idle: streams
+    // configure their handles before this core's share exists.
+    if (ctx->share)
+        curl_easy_setopt(handle, CURLOPT_SHARE, ctx->share);
     CURLMcode result = curl_multi_add_handle(ctx->multi, handle);
     if (result != CURLM_OK)
         return result;
@@ -699,8 +743,12 @@ static void run_cmd(void *arg)
         start_dynamic(c->p);
         break;
     case CMD_PUMP:
-        end_ring_wait(c->p);
-        pump_dynamic(c->p);
+        // The consumer freed a queue range; refill transfer slots.
+        mp_mutex_lock(&c->p->mtx);
+        c->p->service_pending = false;
+        mp_mutex_unlock(&c->p->mtx);
+        if (c->p->dynamic_started)
+            fill_dynamic(c->p);
         break;
     case CMD_FALLBACK_DYNAMIC:
         fallback_dynamic(c->p);
@@ -752,6 +800,69 @@ static void curl_wakeup(void *arg)
     curl_multi_wakeup(ctx->multi);
 }
 
+// DNS answers and TLS sessions shared by every core in the process, so a
+// new playback core resumes TLS instead of repeating full handshakes and
+// certificate-chain verification. Cookies and connections are not shared.
+static mp_static_mutex share_lock = MP_STATIC_MUTEX_INITIALIZER;
+static mp_mutex share_data_locks[CURL_LOCK_DATA_LAST];
+static CURLSH *share;
+static int share_users;
+
+static void share_lock_cb(CURL *handle, curl_lock_data data,
+                          curl_lock_access access, void *userptr)
+{
+    mp_mutex_lock(&share_data_locks[data]);
+}
+
+static void share_unlock_cb(CURL *handle, curl_lock_data data, void *userptr)
+{
+    mp_mutex_unlock(&share_data_locks[data]);
+}
+
+static CURLSH *acquire_share(void)
+{
+    mp_mutex_lock(&share_lock);
+    if (!share) {
+        // A share kept after a failed cleanup still owns initialized locks.
+        for (int n = 0; n < CURL_LOCK_DATA_LAST; n++)
+            mp_mutex_init(&share_data_locks[n]);
+        share = curl_share_init();
+        if (share &&
+            (curl_share_setopt(share, CURLSHOPT_LOCKFUNC, share_lock_cb) ||
+             curl_share_setopt(share, CURLSHOPT_UNLOCKFUNC, share_unlock_cb) ||
+             curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS) ||
+             curl_share_setopt(share, CURLSHOPT_SHARE,
+                               CURL_LOCK_DATA_SSL_SESSION)))
+        {
+            curl_share_cleanup(share);
+            share = NULL;
+        }
+        if (!share) {
+            for (int n = 0; n < CURL_LOCK_DATA_LAST; n++)
+                mp_mutex_destroy(&share_data_locks[n]);
+        }
+    }
+    if (share)
+        share_users++;
+    CURLSH *result = share;
+    mp_mutex_unlock(&share_lock);
+    return result;
+}
+
+// Called after the releasing core's handles are gone.
+static void release_share(void)
+{
+    mp_mutex_lock(&share_lock);
+    if (share && !--share_users &&
+        curl_share_cleanup(share) == CURLSHE_OK)
+    {
+        share = NULL;
+        for (int n = 0; n < CURL_LOCK_DATA_LAST; n++)
+            mp_mutex_destroy(&share_data_locks[n]);
+    }
+    mp_mutex_unlock(&share_lock);
+}
+
 static MP_THREAD_VOID curl_thread(void *arg)
 {
     mp_thread_set_name("curl");
@@ -772,6 +883,7 @@ static MP_THREAD_VOID curl_thread(void *arg)
         set_failed(ctx, curl_easy_strerror(res));
     } else {
         curl_multi_setopt(ctx->multi, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
+        ctx->share = acquire_share();
         mp_dispatch_set_wakeup_fn(ctx->dispatch, curl_wakeup, ctx);
     }
 
@@ -812,7 +924,9 @@ static MP_THREAD_VOID curl_thread(void *arg)
             } else {
                 struct dynamic_request *request = (struct dynamic_request *)ref;
                 succeeded = succeeded && request->response_ok &&
-                            request->size == request->end - request->start &&
+                            request->range &&
+                            request->fetch_pos ==
+                                request->range->end - request->range->start &&
                             !atomic_load_explicit(&request->ref.p->aborted,
                                                   memory_order_relaxed);
             }
@@ -832,11 +946,31 @@ static MP_THREAD_VOID curl_thread(void *arg)
         rate_current(&ctx->traffic, mp_time_ns());
         for (int n = 0; n < MP_CURL_MAX_LANES; n++)
             rate_current(&ctx->lanes[n], mp_time_ns());
-        curl_multi_poll(ctx->multi, NULL, 0, 250, NULL);
+        // Wait until libcurl's own next deadline (at most 250 ms). A wait
+        // that runs to its deadline and returns late measures how long this
+        // thread waited for a CPU, the jitter a receive buffer must absorb.
+        long timeout = -1;
+        curl_multi_timeout(ctx->multi, &timeout);
+        if (timeout < 0 || timeout > 250)
+            timeout = 250;
+        int64_t deadline = mp_time_ns() + timeout * INT64_C(1000000);
+        int ready = 0;
+        curl_multi_poll(ctx->multi, NULL, 0, timeout, &ready);
+        int64_t late = mp_time_ns() - deadline;
+        if (!ready && late >= 0) {
+            atomic_store_explicit(&ctx->recent_lateness_ns,
+                MPMAX(late, atomic_load_explicit(&ctx->recent_lateness_ns,
+                                                 memory_order_relaxed)),
+                memory_order_relaxed);
+            if (late > ctx->peak_lateness_ns)
+                ctx->peak_lateness_ns = late;
+        }
     }
 
     if (ctx->multi) {
         curl_multi_cleanup(ctx->multi);
+        if (ctx->share)
+            release_share();
         curl_global_cleanup();
     }
     MP_THREAD_RETURN();
@@ -863,6 +997,32 @@ struct metrics_snapshot {
     struct curl_ctx *ctx;
     struct mp_curl_metrics *metrics;
 };
+
+// Multiplexed HTTP/2 streams share a connection, so a request count is not
+// a connection count. Runs on the curl thread.
+static int64_t count_connections(struct curl_ctx *ctx)
+{
+    CURL **handles = ctx->multi ? curl_multi_get_handles(ctx->multi) : NULL;
+    if (!handles)
+        return 0;
+    curl_off_t seen[MP_CURL_MAX_LANES * 2 + 2];
+    int count = 0;
+    for (int n = 0; handles[n]; n++) {
+        curl_off_t id = -1;
+        if (curl_easy_getinfo(handles[n], CURLINFO_CONN_ID, &id) != CURLE_OK ||
+            id < 0)
+        {
+            continue;
+        }
+        bool known = false;
+        for (int i = 0; i < count; i++)
+            known |= seen[i] == id;
+        if (!known && count < MP_ARRAY_SIZE(seen))
+            seen[count++] = id;
+    }
+    curl_free(handles);
+    return count;
+}
 
 static void read_metrics(void *arg)
 {
@@ -917,6 +1077,14 @@ static void read_metrics(void *arg)
             ctx->ring_wait.users * (now - ctx->ring_wait.active_started_ns)),
         .consumer_wait_seconds = MP_TIME_NS_TO_S(atomic_load_explicit(
             &ctx->consumer_wait_ns, memory_order_relaxed)),
+        .head_of_line_seconds = MP_TIME_NS_TO_S(atomic_load_explicit(
+            &ctx->head_of_line_ns, memory_order_relaxed)),
+        .peak_reorder_bytes = atomic_load_explicit(&ctx->peak_reorder_bytes,
+                                                   memory_order_relaxed),
+        .physical_connections = count_connections(ctx),
+        .recent_lateness_ms = atomic_exchange_explicit(&ctx->recent_lateness_ns,
+            0, memory_order_relaxed) / 1e6,
+        .peak_lateness_ms = ctx->peak_lateness_ns / 1e6,
         .selected_requests = ctx->selected_requests,
         .latency_ms = ctx->latency_ms,
         .capacity_bytes_per_second = ctx->capacity,
@@ -1050,7 +1218,8 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
         p->phase_delivered += bytes;
     p->paused_bytes = 0;
 
-    mp_cond_broadcast(&p->cond);
+    if (p->consumer_waiting)
+        mp_cond_broadcast(&p->cond);
     mp_mutex_unlock(&p->mtx);
 
     return bytes;
@@ -1123,23 +1292,83 @@ static bool parse_content_range(const char *value, uint64_t *start,
     return true;
 }
 
+// Extend the contiguous published prefix of the queue. Called with mtx held.
+static uint64_t advance_ordered(struct priv *p)
+{
+    uint64_t before = p->ordered_pos;
+    for (int n = 0; n < p->range_count; n++) {
+        struct range_desc *range =
+            &p->ranges[(p->range_head + n) % p->num_ranges];
+        if (range->end <= p->ordered_pos)
+            continue;
+        if (range->start > p->ordered_pos)
+            break;
+        p->ordered_pos = range->start + range->published;
+        if (!range->complete)
+            break;
+    }
+    return p->ordered_pos - before;
+}
+
+// Make a range's stored prefix readable. Any validated prefix may be
+// published: a retry either resumes after it under the same strong validator
+// or re-reads it and must reproduce it byte for byte.
+static void publish_range(struct priv *p, struct range_desc *range)
+{
+    mp_mutex_lock(&p->mtx);
+    p->queued_bytes += range->received - range->published;
+    range->published = range->received;
+    range->complete = range->received == range->end - range->start;
+    uint64_t ordered = advance_ordered(p);
+    int64_t reorder = p->queued_bytes - (p->ordered_pos - p->queue_pos);
+    int64_t peak = atomic_load_explicit(&p->ctx->peak_reorder_bytes,
+                                        memory_order_relaxed);
+    while (reorder > peak &&
+           !atomic_compare_exchange_weak_explicit(&p->ctx->peak_reorder_bytes,
+                &peak, reorder, memory_order_relaxed, memory_order_relaxed))
+    {
+    }
+    if (ordered && !p->startup && range->request &&
+        range->request->ref.generation == p->generation)
+    {
+        p->phase_delivered += ordered;
+    }
+    if (ordered && p->queue_open && p->consumer_waiting)
+        mp_cond_broadcast(&p->cond);
+    mp_mutex_unlock(&p->mtx);
+}
+
 static size_t dynamic_write_callback(char *ptr, size_t size, size_t nmemb,
                                      void *userdata)
 {
     struct dynamic_request *request = userdata;
     struct priv *p = request->ref.p;
+    struct range_desc *range = request->range;
     size_t bytes = size * nmemb;
 
-    if (!request->response_ok ||
+    if (!range || !request->response_ok ||
         atomic_load_explicit(&p->aborted, memory_order_relaxed) ||
-        bytes > request->end - request->start - request->size)
+        bytes > range->end - range->start - request->fetch_pos)
     {
         return CURL_WRITEFUNC_ERROR;
     }
-
-    memcpy(request->data + request->size, ptr, bytes);
-    request->size += bytes;
     record_received_bytes(&request->ref, bytes);
+
+    // A retry without a strong validator re-reads bytes the consumer may
+    // already have taken; they must be identical, or the file changed.
+    size_t pos = request->fetch_pos;
+    size_t overlap = pos < range->received
+        ? MPMIN(bytes, range->received - pos) : 0;
+    if (overlap && memcmp(range->data + pos, ptr, overlap) != 0) {
+        request->changed = true;
+        return CURL_WRITEFUNC_ERROR;
+    }
+    memcpy(range->data + pos + overlap, ptr + overlap, bytes - overlap);
+    request->fetch_pos = pos + bytes;
+    if (request->fetch_pos > range->received) {
+        range->received = request->fetch_pos;
+        publish_range(p, range);
+    }
     return bytes;
 }
 
@@ -1192,19 +1421,27 @@ static size_t dynamic_header_callback(char *buffer, size_t size, size_t nitems,
     if (resp < 200 || (resp >= 300 && resp < 400))
         return bytes;
 
+    struct range_desc *range = request->range;
+    if (!range)
+        return bytes;
+    uint64_t first = range->start + request->fetch_pos;
     uint64_t start = 0;
     uint64_t end = 0;
     int64_t total = -1;
+    // A resumed suffix is only spliced onto published bytes under the same
+    // strong validator; a fresh or re-read range may omit it.
+    const char *etag = header_value(request->curl, "ETag");
+    bool same_entity = !p->etag ||
+        (etag ? strcmp(etag, p->etag) == 0 : request->fetch_pos == 0);
     bool valid =
         resp == 206 &&
         parse_exact_content_range(header_value(request->curl, "Content-Range"),
                             &start, &end, &total) &&
-        start == request->start && end == request->end &&
-        total == p->content_size;
+        start == first && end == range->end &&
+        total == p->content_size && same_entity;
     if (!valid) {
         MP_WARN(p, "parallel range %" PRIu64 "-%" PRIu64
-                   " rejected (HTTP %ld)\n",
-                request->start, request->end - 1, resp);
+                   " rejected (HTTP %ld)\n", first, range->end - 1, resp);
     }
     request->response_ok = valid;
     return bytes;
@@ -1320,6 +1557,10 @@ static void probe_http(struct priv *p, struct bstr line)
     const char *cd = header_value(p->curl, "Content-Disposition");
     if (cd)
         p->server_filename = mp_parse_content_disposition(p, p->s, bstr0(cd));
+    // Weak validators (W/"...") do not promise byte-identical ranges.
+    const char *etag = header_value(p->curl, "ETag");
+    talloc_free(p->etag);
+    p->etag = etag && etag[0] == '"' ? talloc_strdup(p, etag) : NULL;
 
     p->stream_ok = true;
     p->response_ok = true;
@@ -1390,8 +1631,12 @@ static void validate_http_response(struct priv *p, struct bstr line)
     // Servers may cap a reply short of the requested range; on_done()
     // continues from where it stopped.
     p->reply_ranged = resp == 206;
+    // Continuations append to delivered bytes; a different strong validator
+    // means a different file. Servers that omit it on a reply cannot be told.
+    const char *etag = header_value(p->curl, "ETag");
+    bool same_entity = !p->etag || !etag || strcmp(etag, p->etag) == 0;
     bool valid =
-        is_http_success(resp) &&
+        same_entity && is_http_success(resp) &&
         (!p->seekable ||
          (resp == 206 &&
           parse_content_range(range, &start, &end, &total) &&
@@ -1694,44 +1939,28 @@ static void update_adaptation(struct priv *p)
     reset_phase(p, now);
 }
 
-static bool schedule_dynamic_request(struct dynamic_request *request)
+// Start (or retry) the transfer of a range on an idle slot. With a strong
+// validator a retry resumes after the bytes already stored; without one it
+// re-reads the whole range and verifies the stored prefix.
+static bool start_range_transfer(struct dynamic_request *request,
+                                 struct range_desc *range)
 {
     struct priv *p = request->ref.p;
-    uint64_t limit = dynamic_limit(p);
-    if (request->scheduled || p->next_schedule >= limit)
-        return false;
-
-    // Full preallocated segments amortize range/header/TLS bookkeeping.
-    // Shrinking ranges as throughput falls compounds slow-client overhead
-    // and changes the workload in the middle of concurrency comparisons.
-    uint64_t bytes = p->segment_size;
-    if (p->startup) {
-        if (p->next_schedule >= p->startup_end)
-            return false;
-        bytes = MPMIN(bytes, p->startup_end - p->next_schedule);
-        uint64_t remaining = p->startup_end - p->request_start;
-        bytes = MPMIN(bytes, MPMAX(64 * 1024,
-                         remaining / p->selected_requests));
-    }
-    uint64_t end = p->next_schedule +
-                   MPMIN(bytes, limit - p->next_schedule);
-    request->start = p->next_schedule;
-    request->end = end;
-    request->size = 0;
-    request->consumed = 0;
-    request->retry_count = 0;
+    size_t from = p->etag ? range->received : 0;
+    request->range = range;
+    request->fetch_pos = from;
     request->response_ok = false;
-    request->ready = false;
-    request->scheduled = true;
-    p->next_schedule = end;
+    request->changed = false;
+    range->request = request;
 
-    char range[64];
-    snprintf(range, sizeof(range), "%" PRIu64 "-%" PRIu64,
-             request->start, request->end - 1);
-    curl_easy_setopt(request->curl, CURLOPT_RANGE, range);
+    char text[64];
+    snprintf(text, sizeof(text), "%" PRIu64 "-%" PRIu64,
+             range->start + from, range->end - 1);
+    curl_easy_setopt(request->curl, CURLOPT_RANGE, text);
     CURLMcode result = add_curl_handle(p->ctx, request->curl);
     if (result != CURLM_OK) {
-        request->scheduled = false;
+        request->range = NULL;
+        range->request = NULL;
         MP_WARN(p, "could not schedule parallel range: %s\n",
                 curl_multi_strerror(result));
         cmd_async(p, CMD_FALLBACK_DYNAMIC);
@@ -1740,8 +1969,72 @@ static bool schedule_dynamic_request(struct dynamic_request *request)
     begin_measurement(&request->ref);
     request->active = true;
     MP_TRACE(p, "prefetching range %" PRIu64 "-%" PRIu64 "\n",
-             request->start, request->end - 1);
+             range->start + from, range->end - 1);
     return true;
+}
+
+// Queue the next range at next_schedule, or return NULL when every queue
+// entry still holds unread bytes.
+static struct range_desc *queue_next_range(struct priv *p)
+{
+    uint64_t limit = dynamic_limit(p);
+    if (p->next_schedule >= limit)
+        return NULL;
+
+    // Full preallocated segments amortize range/header/TLS bookkeeping.
+    // Shrinking ranges as throughput falls compounds slow-client overhead
+    // and changes the workload in the middle of concurrency comparisons.
+    uint64_t bytes = p->segment_size;
+    if (p->startup) {
+        if (p->next_schedule >= p->startup_end)
+            return NULL;
+        bytes = MPMIN(bytes, p->startup_end - p->next_schedule);
+        uint64_t remaining = p->startup_end - p->ordered_pos;
+        bytes = MPMIN(bytes, MPMAX(64 * 1024,
+                         remaining / p->selected_requests));
+    }
+
+    mp_mutex_lock(&p->mtx);
+    struct range_desc *range = NULL;
+    if (p->range_count < p->num_ranges) {
+        range = &p->ranges[(p->range_head + p->range_count) % p->num_ranges];
+        p->range_count++;
+        range->start = p->next_schedule;
+        range->end = p->next_schedule + MPMIN(bytes, limit - p->next_schedule);
+        range->published = 0;
+        range->consumed = 0;
+        range->complete = false;
+    }
+    mp_mutex_unlock(&p->mtx);
+    if (!range)
+        return NULL;
+    range->received = 0;
+    range->request = NULL;
+    range->retry_count = 0;
+    p->next_schedule = range->end;
+    return range;
+}
+
+// Every range has been fetched and nothing remains to schedule.
+static void check_dynamic_eof(struct priv *p)
+{
+    if (!p->dynamic_started || !p->primary_done ||
+        p->next_schedule < dynamic_limit(p))
+    {
+        return;
+    }
+    mp_mutex_lock(&p->mtx);
+    bool done = true;
+    for (int n = 0; n < p->range_count; n++)
+        done &= p->ranges[(p->range_head + n) % p->num_ranges].complete;
+    if (done) {
+        p->finished = true;
+        p->stream_eof = true;
+        mp_cond_broadcast(&p->cond);
+    }
+    mp_mutex_unlock(&p->mtx);
+    if (done)
+        end_ring_wait(p);
 }
 
 static void fill_dynamic(struct priv *p)
@@ -1762,7 +2055,7 @@ static void fill_dynamic(struct priv *p)
         bool buffered = p->ctx->buffer_generation > p->startup_buffer_generation &&
             p->opts->startup_buffer_seconds > 0 &&
             p->ctx->buffer_seconds >= p->opts->startup_buffer_seconds;
-        if (p->request_start >= p->startup_end || buffered) {
+        if (p->ordered_pos >= p->startup_end || buffered) {
             learning_tick(p, now);
             p->startup = false;
             int steady = MPMIN(p->opts->initial_requests,
@@ -1783,31 +2076,57 @@ static void fill_dynamic(struct priv *p)
     int scheduled = p->active;
     for (int n = 0; n < p->num_requests; n++) {
         struct dynamic_request *request = &p->requests[n];
-        if (request->scheduled && request->ref.generation != p->generation)
+        if (request->active && request->ref.generation != p->generation)
             return;
-        scheduled += request->scheduled;
+        scheduled += request->active;
     }
+    // Storage, not ring space, bounds read-ahead: a range holds its bytes
+    // until they are read, so later ranges never overtake the queue's budget.
+    // While the consumer still has a range of unread bytes, wait for room to
+    // refill a whole batch. Trickling one range per consumed range would
+    // measure one transfer while reporting the selected count.
     mp_mutex_lock(&p->mtx);
-    bool space = p->count < p->buffer_size * 3 / 4;
-    if (!space)
-    {
-        p->dynamic_waiting = true;
-        begin_ring_wait(p, mp_time_ns());
-    }
+    int room = p->num_ranges - p->range_count;
+    uint64_t unread = p->ordered_pos - p->queue_pos;
     mp_mutex_unlock(&p->mtx);
-    if (!space)
+    int wanted = p->selected_requests - scheduled;
+    if (wanted > 0 && room < wanted && unread >= p->segment_size) {
+        begin_ring_wait(p, mp_time_ns());
         return;
+    }
     for (int n = 0; n < p->num_requests && scheduled < p->selected_requests; n++) {
-        if (p->active && n == 0)
+        struct dynamic_request *request = &p->requests[n];
+        if ((p->active && n == 0) || request->active)
             continue;
-        if (schedule_dynamic_request(&p->requests[n]))
-            scheduled++;
+        struct range_desc *range = queue_next_range(p);
+        if (!range) {
+            if (p->next_schedule < dynamic_limit(p))
+                begin_ring_wait(p, mp_time_ns());
+            break;
+        }
+        end_ring_wait(p);
+        if (!start_range_transfer(request, range))
+            break;
+        scheduled++;
     }
 }
 
 static void stop_dynamic(struct priv *p)
 {
     end_ring_wait(p);
+    // The consumer copies queue bytes without the lock; wait before the
+    // storage goes away. Seek and close come from the consumer itself, but
+    // a fallback is raised asynchronously on this thread.
+    mp_mutex_lock(&p->mtx);
+    while (p->copying) {
+        p->copy_waiter = true;
+        mp_cond_wait(&p->cond, &p->mtx);
+    }
+    p->copy_waiter = false;
+    p->queue_open = false;
+    p->range_head = p->range_count = 0;
+    p->queued_bytes = 0;
+    mp_mutex_unlock(&p->mtx);
     for (int n = 0; n < p->num_requests; n++) {
         struct dynamic_request *request = &p->requests[n];
         if (request->active) {
@@ -1818,15 +2137,15 @@ static void stop_dynamic(struct priv *p)
         if (request->curl)
             curl_easy_cleanup(request->curl);
     }
-    talloc_free(p->request_data);
+    talloc_free(p->range_data);
+    talloc_free(p->ranges);
     talloc_free(p->requests);
-    p->request_data = NULL;
+    p->range_data = NULL;
+    p->ranges = NULL;
     p->requests = NULL;
+    p->num_ranges = 0;
     p->num_requests = 0;
     p->dynamic_started = false;
-    mp_mutex_lock(&p->mtx);
-    p->dynamic_waiting = false;
-    mp_mutex_unlock(&p->mtx);
 }
 
 static void start_dynamic(struct priv *p)
@@ -1840,8 +2159,13 @@ static void start_dynamic(struct priv *p)
     }
     if (p->primary_end >= dynamic_limit(p))
         return;
-    if (segment_size > SIZE_MAX ||
-        (size_t)count > SIZE_MAX / (size_t)segment_size)
+    // The queue gets the same memory as the old per-request segments: one
+    // ring's worth, split into as many whole ranges as fit.
+    int ranges = segment_size > 0
+        ? MPCLAMP(p->buffer_size / segment_size, count, MP_CURL_MAX_RANGES)
+        : 0;
+    if (segment_size > SIZE_MAX || !ranges ||
+        (size_t)ranges > SIZE_MAX / (size_t)segment_size)
     {
         MP_WARN(p, "parallel range buffer size is too large\n");
         p->dynamic_supported = false;
@@ -1853,18 +2177,30 @@ static void start_dynamic(struct priv *p)
     p->primary_end = MPMIN(p->primary_end, limit);
     p->next_schedule = p->primary_end;
     p->num_requests = count;
+    p->num_ranges = ranges;
     p->requests = talloc_zero_array(p, struct dynamic_request, count);
-    p->request_data = talloc_size(p, count * segment_bytes);
-    if (!p->requests || !p->request_data) {
+    p->ranges = talloc_zero_array(p, struct range_desc, ranges);
+    p->range_data = talloc_size(p, ranges * segment_bytes);
+    if (!p->requests || !p->ranges || !p->range_data) {
         MP_WARN(p, "could not allocate parallel range requests\n");
-        talloc_free(p->request_data);
+        talloc_free(p->range_data);
+        talloc_free(p->ranges);
         talloc_free(p->requests);
-        p->request_data = NULL;
+        p->range_data = NULL;
+        p->ranges = NULL;
         p->requests = NULL;
-        p->num_requests = 0;
+        p->num_requests = p->num_ranges = 0;
         p->dynamic_supported = false;
         return;
     }
+    for (int n = 0; n < ranges; n++)
+        p->ranges[n].data = p->range_data + n * segment_bytes;
+    mp_mutex_lock(&p->mtx);
+    p->range_head = p->range_count = 0;
+    p->ordered_pos = p->queue_pos = p->primary_end;
+    p->queued_bytes = 0;
+    p->queue_open = false;
+    mp_mutex_unlock(&p->mtx);
     p->dynamic_started = true;
 
     for (int n = 0; n < count; n++) {
@@ -1873,7 +2209,6 @@ static void start_dynamic(struct priv *p)
         request->ref.p = p;
         request->ref.lane = n;
         request->curl = curl_easy_init();
-        request->data = p->request_data + n * segment_bytes;
         if (!request->curl) {
             MP_WARN(p, "could not allocate parallel range request\n");
             p->dynamic_supported = false;
@@ -1897,73 +2232,19 @@ static void start_dynamic(struct priv *p)
     fill_dynamic(p);
 
     MP_VERBOSE(p, "parallel ranged streaming enabled: %d requests, "
-                  "%" PRIu64 " byte ranges\n",
-               count, segment_size);
+                  "%d queued %" PRIu64 " byte ranges\n",
+               count, ranges, segment_size);
 }
 
-static void pump_dynamic(struct priv *p)
+// The primary request has delivered everything before the queue: let the
+// consumer read on into it.
+static void open_queue(struct priv *p)
 {
-    if (!p->dynamic_started || !p->primary_done)
-        return;
-
-    for (;;) {
-        struct dynamic_request *next = NULL;
-        for (int n = 0; n < p->num_requests; n++) {
-            struct dynamic_request *request = &p->requests[n];
-            if (request->ready &&
-                request->start + request->consumed == p->request_start)
-            {
-                next = request;
-                break;
-            }
-        }
-        if (!next)
-            break;
-
-        size_t available = next->size - next->consumed;
-        mp_mutex_lock(&p->mtx);
-        size_t space = p->buffer_size - p->count;
-        size_t copy = MPMIN(space, available);
-        if (copy > 0) {
-            size_t tail_chunk = MPMIN(p->buffer_size - p->tail, copy);
-            memcpy(p->buffer + p->tail, next->data + next->consumed,
-                   tail_chunk);
-            memcpy(p->buffer, next->data + next->consumed + tail_chunk,
-                   copy - tail_chunk);
-            p->tail = (p->tail + copy) % p->buffer_size;
-            p->count += copy;
-            next->consumed += copy;
-            p->request_start += copy;
-            if (!p->startup && next->ref.generation == p->generation)
-                p->phase_delivered += copy;
-            mp_cond_broadcast(&p->cond);
-        }
-        if (copy == 0) {
-            p->dynamic_waiting = true;
-            begin_ring_wait(p, mp_time_ns());
-        }
-        mp_mutex_unlock(&p->mtx);
-
-        if (copy == 0)
-            return;
-        if (next->consumed < next->size)
-            continue;
-
-        next->scheduled = false;
-        next->ready = false;
-        fill_dynamic(p);
-    }
-    fill_dynamic(p);
-
-    if (p->request_start >= dynamic_limit(p)) {
-        p->finished = true;
-        mp_mutex_lock(&p->mtx);
-        p->stream_eof = true;
-        end_ring_wait(p);
-        p->dynamic_waiting = false;
-        mp_cond_broadcast(&p->cond);
-        mp_mutex_unlock(&p->mtx);
-    }
+    mp_mutex_lock(&p->mtx);
+    p->queue_open = true;
+    mp_cond_broadcast(&p->cond);
+    mp_mutex_unlock(&p->mtx);
+    check_dynamic_eof(p);
 }
 
 static void fallback_dynamic(struct priv *p)
@@ -1974,6 +2255,14 @@ static void fallback_dynamic(struct priv *p)
         p->primary_done &&
         !atomic_load_explicit(&p->aborted, memory_order_relaxed);
     stop_dynamic(p);
+    // Unread queue bytes are dropped and fetched again by one request from
+    // the first byte the consumer has not taken; the ring holds only bytes
+    // before the queue, so nothing is delivered twice.
+    if (resume_primary) {
+        mp_mutex_lock(&p->mtx);
+        p->request_start = p->queue_pos;
+        mp_mutex_unlock(&p->mtx);
+    }
     p->dynamic_supported = false;
     p->selected_requests = 1;
     p->previous_requests = 0;
@@ -1988,13 +2277,29 @@ static void fallback_dynamic(struct priv *p)
 static void on_dynamic_done(struct dynamic_request *request, CURLcode code)
 {
     struct priv *p = request->ref.p;
+    struct range_desc *range = request->range;
     bool aborted = atomic_load_explicit(&p->aborted, memory_order_relaxed);
-    size_t expected = request->end - request->start;
+    request->range = NULL;
+    if (!range)
+        return;
+    range->request = NULL;
+    size_t expected = range->end - range->start;
     if (code == CURLE_OK && request->response_ok &&
-        request->size == expected && !aborted)
+        request->fetch_pos == expected && !aborted)
     {
-        request->ready = true;
-        pump_dynamic(p);
+        fill_dynamic(p);
+        check_dynamic_eof(p);
+        return;
+    }
+
+    if (request->changed) {
+        // Bytes already delivered no longer match the server's file.
+        MP_ERR(p, "parallel range %" PRIu64 "-%" PRIu64 " changed while "
+                  "it was retried\n", range->start, range->end - 1);
+        mp_mutex_lock(&p->mtx);
+        p->stream_error = true;
+        mp_cond_broadcast(&p->cond);
+        mp_mutex_unlock(&p->mtx);
         return;
     }
 
@@ -2002,28 +2307,22 @@ static void on_dynamic_done(struct dynamic_request *request, CURLcode code)
                              (code == CURLE_OK || code == CURLE_WRITE_ERROR);
     bool recoverable =
         !aborted && (response_rejected || is_recoverable_error(code)) &&
-        request->retry_count < p->opts->max_retries;
+        range->retry_count < p->opts->max_retries;
     if (recoverable) {
-        request->retry_count++;
+        range->retry_count++;
         atomic_fetch_add_explicit(&p->ctx->retry_attempts, 1,
                                   memory_order_relaxed);
-        request->size = 0;
-        request->consumed = 0;
-        request->response_ok = false;
         const char *reason = response_rejected
             ? "HTTP range rejected" : curl_easy_strerror(code);
         MP_WARN(p, "%s, retrying parallel range (#%d)\n",
-                reason, request->retry_count);
-        CURLMcode result = add_curl_handle(p->ctx, request->curl);
-        if (result == CURLM_OK) {
-            uint64_t generation = request->ref.generation;
+                reason, range->retry_count);
+        uint64_t generation = request->ref.generation;
+        if (start_range_transfer(request, range)) {
             if (generation != p->generation)
                 p->transitioning++;
-            begin_measurement(&request->ref);
             request->ref.generation = generation;
-            request->active = true;
-            return;
         }
+        return;
     }
 
     if (!aborted) {
@@ -2092,7 +2391,7 @@ static void on_done(struct priv *p, CURLcode code)
                     return;
                 }
                 fill_dynamic(p);
-                pump_dynamic(p);
+                open_queue(p);
                 return;
             }
         }
@@ -2213,6 +2512,8 @@ static void setup_curl(struct priv *p, CURL *c)
     curl_easy_setopt(c, CURLOPT_HTTP_VERSION, (long)p->opts->http_version);
     curl_easy_setopt(c, CURLOPT_HSTS_CTRL, (long)CURLHSTS_ENABLE);
     curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
+    // libcurl's 16 KiB default costs one body callback (and recv) per 16 KiB.
+    curl_easy_setopt(c, CURLOPT_BUFFERSIZE, (long)p->opts->read_size);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS,
                      (long)(p->opts->connect_timeout * 1000));
     // Abort a transfer that receives nothing for --network-timeout seconds,
@@ -2281,37 +2582,70 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
 
     mp_mutex_lock(&p->mtx);
 
-    while (p->count == 0 && !p->stream_eof && !p->stream_error &&
+    // The ring holds bytes before the queue, so it is always drained first.
+    while (p->count == 0 && !(p->queue_open && p->ordered_pos > p->queue_pos) &&
+           !p->stream_eof && !p->stream_error &&
            !atomic_load_explicit(&p->aborted, memory_order_relaxed))
     {
         int64_t started = mp_time_ns();
+        // Later bytes are already here; only the next one is missing.
+        bool blocked = p->queue_open && p->count == 0 &&
+                       p->queued_bytes > p->ordered_pos - p->queue_pos;
+        p->consumer_waiting = true;
         mp_cond_wait(&p->cond, &p->mtx);
-        atomic_fetch_add_explicit(&p->ctx->consumer_wait_ns,
-                                  mp_time_ns() - started,
+        p->consumer_waiting = false;
+        int64_t waited = mp_time_ns() - started;
+        atomic_fetch_add_explicit(&p->ctx->consumer_wait_ns, waited,
                                   memory_order_relaxed);
+        if (blocked) {
+            atomic_fetch_add_explicit(&p->ctx->head_of_line_ns, waited,
+                                      memory_order_relaxed);
+        }
     }
 
     size_t copy = MPMIN((size_t)max_len, p->count);
+    bool service = false;
     if (copy > 0) {
         size_t head_chunk = MPMIN(p->buffer_size - p->head, copy);
         memcpy(buffer, p->buffer + p->head, head_chunk);
         memcpy((char *)buffer + head_chunk, p->buffer, copy - head_chunk);
         p->head = (p->head + copy) % p->buffer_size;
         p->count -= copy;
+    } else if (p->queue_open && p->ordered_pos > p->queue_pos &&
+               !p->stream_error)
+    {
+        // Claim published bytes of the oldest range and copy them without
+        // the lock every curl callback needs. Published bytes never change
+        // and the storage stays until consumed; a fallback waits for us.
+        struct range_desc *range = &p->ranges[p->range_head];
+        size_t offset = range->consumed;
+        copy = MPMIN((size_t)max_len, range->published - offset);
+        p->copying = true;
+        mp_mutex_unlock(&p->mtx);
+        memcpy(buffer, range->data + offset, copy);
+        mp_mutex_lock(&p->mtx);
+        p->copying = false;
+        if (p->copy_waiter)
+            mp_cond_broadcast(&p->cond);
+        range->consumed += copy;
+        p->queue_pos += copy;
+        p->queued_bytes -= copy;
+        if (range->complete && range->consumed == range->end - range->start) {
+            p->range_head = (p->range_head + 1) % p->num_ranges;
+            p->range_count--;
+            service = !p->service_pending;
+            p->service_pending = true;
+        }
     }
 
     bool unpause = p->paused && !p->stream_eof && !p->stream_error &&
                    p->buffer_size - p->count >= p->buffer_size / 2;
-    bool pump = p->dynamic_waiting && !p->stream_eof && !p->stream_error &&
-                p->buffer_size - p->count >= p->buffer_size / 2;
-    if (pump)
-        p->dynamic_waiting = false;
 
     mp_mutex_unlock(&p->mtx);
 
     if (unpause)
         cmd_async(p, CMD_UNPAUSE);
-    if (pump)
+    if (service)
         cmd_async(p, CMD_PUMP);
 
     return copy;

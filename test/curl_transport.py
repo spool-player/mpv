@@ -14,7 +14,10 @@ import http.server
 import json
 import pathlib
 import re
+import shutil
+import ssl
 import struct
+import subprocess
 import tempfile
 import threading
 import time
@@ -153,6 +156,7 @@ class Player:
         started = time.monotonic()
         self.command("loadfile", url)
         samples = []
+        positions = []
         first_progress = None
         was_loaded = False
         while time.monotonic() - started < timeout:
@@ -165,6 +169,8 @@ class Player:
                 if loaded:
                     loaded(self)
             position = self.get("time-pos")
+            if position is not None:
+                positions.append((time.monotonic(), position))
             if first_progress is None and position is not None and position > 0:
                 first_progress = time.monotonic() - started
             if event.id == 7:
@@ -175,14 +181,16 @@ class Player:
                     raise AssertionError(f"playback did not reach EOF: reason={end.reason}, error={end.error}")
                 return {"seconds": time.monotonic() - started,
                         "first-progress-seconds": first_progress,
-                        "samples": samples, "metrics": self.get("curl-transport-metrics")}
+                        "samples": samples, "positions": positions,
+                        "metrics": self.get("curl-transport-metrics")}
         raise AssertionError("transport did not reach EOF")
 
 
 class Origin:
     def __init__(self, size=8 << 20, latency=0.04, per_lane=2 << 20,
                  shared=0, serialized=False, reorder=False, fault=None,
-                 cap=0, unknown_size=False, contention=False):
+                 cap=0, unknown_size=False, contention=False, etag=None,
+                 changed=False, pause=None, fault_after=1, tls=None):
         pcm = (bytes(range(256)) * ((size + 255) // 256))[:size - size % 4]
         self.pcm = pcm
         self.payload = (b"RIFF" + struct.pack("<I", len(pcm) + 36) + b"WAVEfmt " +
@@ -192,6 +200,14 @@ class Origin:
         self.serialized, self.reorder, self.fault = serialized, reorder, fault
         self.cap, self.unknown_size = cap, unknown_size
         self.contention = contention
+        # etag: strong validator to send; changed: the file is replaced after
+        # the injected fault; pause: (offset, seconds) to go quiet mid-body.
+        self.etag, self.changed, self.pause = etag, changed, pause
+        self.fault_after = fault_after  # first request start eligible for the fault
+        self.replaced = False
+        self.resumed = []  # per TLS request: did the handshake resume a session
+        self.fault_range = None
+        self.pause_window = None
         self.active = 0
         self.lock = threading.Lock()
         self.disk = threading.Lock()
@@ -220,8 +236,13 @@ class Origin:
                 if origin.cap and match:
                     end = min(end, start + origin.cap)
                 with origin.lock:
-                    inject = bool(origin.fault and not origin.faulted and start > 0)
+                    if origin.tls:
+                        origin.resumed.append(self.connection.session_reused)
+                    inject = bool(origin.fault and not origin.faulted and start >= origin.fault_after)
                     origin.faulted |= inject
+                    if inject:
+                        origin.fault_range = (start, end)
+                    payload, etag = origin.representation()
                     origin.requests.append((start, end))
                     origin.active += 1
                 guard = origin.disk if origin.serialized else contextlib.nullcontext()
@@ -232,6 +253,8 @@ class Origin:
                         self.send_header("Accept-Ranges", "bytes")
                         self.send_header("Content-Type", "audio/wav")
                         self.send_header("Content-Length", str(end - start))
+                        if etag:
+                            self.send_header("ETag", etag)
                         if match:
                             first = start + 1 if inject and origin.fault == "range" else start
                             total = "*" if origin.unknown_size else len(origin.payload)
@@ -241,7 +264,12 @@ class Origin:
                         stop = start + (end - start) // 2 if cut else end
                         deadline = time.monotonic()
                         for offset in range(start, stop, 16384):
-                            block = origin.payload[offset:min(offset + 16384, stop)]
+                            if origin.pause and origin.pause_window is None and \
+                                    offset <= origin.pause[0] < offset + 16384:
+                                paused = time.monotonic()
+                                time.sleep(origin.pause[1])
+                                origin.pause_window = (paused, time.monotonic())
+                            block = payload[offset:min(offset + 16384, stop)]
                             if origin.shared:
                                 with origin.lock:
                                     deadline_shared = max(time.monotonic(), origin.next_shared)
@@ -262,6 +290,9 @@ class Origin:
                             time.sleep(STALL_SECONDS)
                         if stop != end:
                             self.close_connection = True
+                            if origin.changed:
+                                with origin.lock:
+                                    origin.replaced = True
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 finally:
@@ -270,7 +301,19 @@ class Origin:
 
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
+        self.tls = tls
+        if tls:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(tls / "cert.pem", tls / "key.pem")
+            self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def representation(self):
+        if not self.replaced:
+            return self.payload, self.etag
+        # Same length, different samples: only validators or bytes reveal it.
+        body = self.payload[:44] + bytes(b ^ 0x5a for b in self.payload[44:])
+        return body, '"replaced"' if self.etag else None
 
     def __enter__(self):
         self.thread.start()
@@ -283,7 +326,8 @@ class Origin:
 
     @property
     def url(self):
-        return f"http://127.0.0.1:{self.server.server_port}/fixture.wav"
+        scheme = "https" if self.tls else "http"
+        return f"{scheme}://127.0.0.1:{self.server.server_port}/fixture.wav"
 
 
 LIBRARY = None
@@ -374,6 +418,117 @@ class CurlTransport(unittest.TestCase):
                 finally:
                     player.close()
                 self.assertEqual(output.read_bytes(), origin.pcm)
+
+    def test_published_prefix_is_read_before_its_range_completes(self):
+        # The first parallel range goes quiet halfway while later ranges are
+        # ready. Its received prefix must reach playback during the pause
+        # instead of waiting for the whole range (or the ranges behind it).
+        mib = 1 << 20
+        with Origin(size=8 << 20, latency=0.01, per_lane=4 << 20,
+                    pause=(mib + mib // 2, 3.0)) as origin:
+            player = Player(LIBRARY, **{"curl-adaptive": "no", "curl-max-request-size": "1MiB",
+                                       "curl-buffer-size": "8MiB"})
+            try:
+                result = player.play(origin.url)
+            finally:
+                player.close()
+            self.assertIsNotNone(origin.pause_window)
+            paused, resumed = origin.pause_window
+            during = [position for at, position in result["positions"]
+                      if paused + 1.0 <= at <= resumed - 0.2]
+            self.assertTrue(during)
+            range_start = (mib - 44) / 192000
+            self.assertGreater(max(during), range_start + 1.5)
+            # The consumer then waits on the paused range with later ranges
+            # retained: that wait is head-of-line blocking, nothing else.
+            metrics = result["metrics"]
+            self.assertGreater(metrics["head-of-line-seconds"], 1.0)
+            self.assertLess(metrics["head-of-line-seconds"], metrics["consumer-wait-seconds"] + 0.01)
+            self.assertGreater(metrics["peak-reorder-bytes"], mib)
+            connections = [sample["physical-connections"] for _, sample in result["samples"]]
+            self.assertGreaterEqual(max(connections), 2)
+            self.assertLessEqual(max(connections), 4)
+
+    def test_retry_resumes_or_verifies_published_prefix(self):
+        # A range truncated after its prefix was published is completed from
+        # its suffix under a strong validator, or re-read in full and verified
+        # without one. Either way playback receives every byte exactly once.
+        for etag in ('"v1"', None):
+            with self.subTest(etag=etag), Origin(size=2 << 20, fault="truncate", etag=etag,
+                                                 fault_after=512 << 10) as origin, \
+                    tempfile.TemporaryDirectory() as directory:
+                output = pathlib.Path(directory) / "actual.pcm"
+                player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
+                                           "ao-pcm-waveheader": "no", "audio-format": "s16",
+                                           "curl-adaptive": "no"})
+                try:
+                    player.play(origin.url)
+                finally:
+                    player.close()
+                self.assertEqual(output.read_bytes(), origin.pcm)
+                start, end = origin.fault_range
+                middle = start + (end - start) // 2
+                starts = [first for first, _ in origin.requests]
+                if etag:
+                    self.assertIn(middle, starts)
+                    self.assertEqual(starts.count(start), 1)
+                else:
+                    self.assertNotIn(middle, starts)
+                    self.assertEqual(starts.count(start), 2)
+
+    def test_replaced_file_is_never_spliced_into_playback(self):
+        # The file changes while a published range is being retried. Whether
+        # the validator or the re-read bytes reveal it, playback must stop
+        # with a prefix of the original rather than mix two files.
+        for etag in ('"v1"', None):
+            # Fault after lavf's 5 MB format probe, which reads and seeks back.
+            with self.subTest(etag=etag), Origin(size=8 << 20, fault="truncate", etag=etag,
+                                                 changed=True, fault_after=7 << 20) as origin, \
+                    tempfile.TemporaryDirectory() as directory:
+                output = pathlib.Path(directory) / "actual.pcm"
+                player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
+                                           "ao-pcm-waveheader": "no", "audio-format": "s16",
+                                           "curl-adaptive": "no", "curl-max-retries": "1"})
+                try:
+                    with contextlib.suppress(AssertionError):
+                        player.play(origin.url, timeout=30)
+                finally:
+                    player.close()
+                actual = output.read_bytes() if output.exists() else b""
+                self.assertTrue(origin.replaced)
+                self.assertLess(len(actual), len(origin.pcm))
+                self.assertEqual(actual, origin.pcm[:len(actual)])
+
+    def test_cores_share_tls_sessions(self):
+        # Every playback starts a new core. A second core must resume the
+        # first core's TLS session instead of a full handshake, while each
+        # core keeps its own connections.
+        if not shutil.which("openssl"):
+            self.skipTest("openssl is required to create a test certificate")
+        with tempfile.TemporaryDirectory() as directory:
+            tls = pathlib.Path(directory)
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt",
+                            "ec_paramgen_curve:P-256", "-nodes", "-days", "1", "-subj", "/CN=127.0.0.1",
+                            "-addext", "subjectAltName=IP:127.0.0.1", "-keyout", tls / "key.pem",
+                            "-out", tls / "cert.pem"], check=True, capture_output=True)
+            options = {"tls-ca-file": tls / "cert.pem", "tls-verify": "yes",
+                       "curl-adaptive": "no", "curl-parallel-requests": "1"}
+            with Origin(size=1 << 20, tls=tls) as origin:
+                first = Player(LIBRARY, **options)
+                try:
+                    first.play(origin.url)
+                    handshakes = len(origin.resumed)
+                    second = Player(LIBRARY, **options)
+                    try:
+                        second.play(origin.url)
+                    finally:
+                        second.close()
+                finally:
+                    first.close()
+            self.assertGreater(handshakes, 0)
+            self.assertFalse(origin.resumed[0])
+            self.assertGreater(len(origin.resumed), handshakes)
+            self.assertTrue(origin.resumed[handshakes])
 
     def test_capped_and_unsized_replies_are_continued(self):
         # Servers may answer a range with less than was asked, and may not

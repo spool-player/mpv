@@ -6044,6 +6044,11 @@ TLS/connection diagnostics), set ``--msg-level=curl=trace``.
     network thread from the consumer (default: 4 MiB, minimum: 32 KiB).
     Lower values may reduce in-flight data and reduce latency.
 
+``--curl-read-size=<bytes>``
+    Receive buffer for each libcurl transfer (default: 256KiB, 16KiB to
+    10MiB). Larger values deliver body data in fewer callbacks and receive
+    calls; every active request holds one buffer.
+
 ``--curl-max-request-size=<bytes>``
     For seekable streams, split the transfer into Range requests of at most
     this size (default: 0, i.e. one open-ended request for the whole stream).

@@ -18,6 +18,7 @@ import shutil
 import ssl
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -530,6 +531,34 @@ class CurlTransport(unittest.TestCase):
             demand = playing[-1]["playback-demand-bits-per-second"]
             self.assertGreater(demand, 1536000 * 0.75)
             self.assertLess(demand, 1536000 * 1.25)
+
+    def test_socket_and_host_probes_match_the_kernel(self):
+        # RTT comes from the kernel's TCP state, not request timing, and host
+        # receive ceilings and AES support are what the system reports.
+        if not sys.platform.startswith("linux"):
+            self.skipTest("compares against Linux /proc")
+        with Origin(size=4 << 20, latency=0.05) as origin:
+            player = Player(LIBRARY)
+            try:
+                result = player.play(origin.url)
+            finally:
+                player.close()
+        live = [metrics for _, metrics in result["samples"] if metrics["open-sockets"] > 0]
+        self.assertTrue(live)
+        rtts = [metrics["tcp-rtt-min-ms"] for metrics in live if metrics["tcp-rtt-min-ms"] >= 0]
+        self.assertTrue(rtts)
+        # Loopback RTT is far below the origin's 50 ms response delay.
+        self.assertLess(max(rtts), 20)
+        self.assertTrue(any(metrics["max-socket-receive-buffer-bytes"] > 0 for metrics in live))
+        metrics = result["metrics"]
+        self.assertGreater(metrics["sockets-opened"], 0)
+        rmem_max = int(pathlib.Path("/proc/sys/net/core/rmem_max").read_text())
+        autotune = int(pathlib.Path("/proc/sys/net/ipv4/tcp_rmem").read_text().split()[2])
+        self.assertEqual(metrics["host-rmem-max-bytes"], rmem_max)
+        self.assertEqual(metrics["host-receive-autotune-max-bytes"], autotune)
+        flags = re.search(r"^(?:flags|Features)\s*:(.*)$", pathlib.Path("/proc/cpuinfo").read_text(), re.M)
+        if flags:
+            self.assertEqual(metrics["hw-aes"], int("aes" in flags[1].split()))
 
     def test_cores_share_tls_sessions(self):
         # Every playback starts a new core. A second core must resume the

@@ -179,7 +179,7 @@ class Player:
                 end = C.cast(event.data, C.POINTER(EndFile)).contents
                 if end.reason != 0:
                     raise AssertionError(f"playback did not reach EOF: reason={end.reason}, error={end.error}")
-                return {"seconds": time.monotonic() - started,
+                return {"seconds": time.monotonic() - started, "started": started,
                         "first-progress-seconds": first_progress,
                         "samples": samples, "positions": positions,
                         "metrics": self.get("curl-transport-metrics")}
@@ -498,6 +498,38 @@ class CurlTransport(unittest.TestCase):
                 self.assertTrue(origin.replaced)
                 self.assertLess(len(actual), len(origin.pcm))
                 self.assertEqual(actual, origin.pcm[:len(actual)])
+
+    def test_player_reports_playback_state_to_transport(self):
+        # No host control at all: the player itself tells the transport when
+        # the viewer paused, and what playback actually consumes, including
+        # while the cache is full and the ordinary cache timer is idle.
+        with Origin(size=4 << 20, latency=0.01) as origin:
+            player = Player(LIBRARY, **{"pause": "yes", "ao-null-untimed": "no"})
+            observed = {}
+
+            def paused_then_play(current):
+                time.sleep(0.5)
+                before = current.get("curl-transport-metrics")
+                time.sleep(1.5)
+                after = current.get("curl-transport-metrics")
+                observed["paused"] = (before, after)
+                observed["resumed-at"] = time.monotonic()
+                current.set("pause", "no")
+
+            try:
+                result = player.play(origin.url, loaded=paused_then_play)
+            finally:
+                player.close()
+            before, after = observed["paused"]
+            self.assertTrue(after["playback-user-paused"])
+            self.assertGreaterEqual(after["playback-state-updates"] - before["playback-state-updates"], 4)
+            playing = [metrics for at, metrics in result["samples"]
+                       if result["started"] + at >= observed["resumed-at"] + 2]
+            self.assertTrue(playing)
+            self.assertFalse(playing[-1]["playback-user-paused"])
+            demand = playing[-1]["playback-demand-bits-per-second"]
+            self.assertGreater(demand, 1536000 * 0.75)
+            self.assertLess(demand, 1536000 * 1.25)
 
     def test_cores_share_tls_sessions(self):
         # Every playback starts a new core. A second core must resume the

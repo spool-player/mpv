@@ -1746,6 +1746,14 @@ static int mp_property_curl_transport_metrics(void *ctx,
                         metrics.recent_lateness_ms);
     node_map_add_double(result, "peak-scheduling-lateness-ms",
                         metrics.peak_lateness_ms);
+    node_map_add_int64(result, "playback-state-updates",
+                       metrics.playback_state_updates);
+    node_map_add_double(result, "playback-buffer-seconds",
+                        metrics.playback_buffer_seconds);
+    node_map_add_double(result, "playback-demand-bits-per-second",
+                        metrics.playback_demand_bitrate);
+    node_map_add_flag(result, "playback-user-paused",
+                      metrics.playback_user_paused);
     node_map_add_int64(result, "selected-requests", metrics.selected_requests);
     node_map_add_double(result, "latency-ms", metrics.latency_ms);
     node_map_add_int64(result, "capacity-bytes-per-second",

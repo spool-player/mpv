@@ -4887,6 +4887,7 @@ void demux_get_reader_state(struct demuxer *demuxer, struct demux_reader_state *
             .duration = -1,
         },
         .total_bytes = in->total_bytes,
+        .max_fw_bytes = in->max_bytes,
         .seeking = in->seeking_in_progress,
         .low_level_seeks = in->low_level_seeks,
         .ts_last = in->demux_ts,

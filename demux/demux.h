@@ -49,6 +49,7 @@ struct demux_reader_state {
     struct demux_ctrl_ts_info ts_per_stream[STREAM_TYPE_COUNT];
     int64_t total_bytes;
     int64_t fw_bytes;
+    int64_t max_fw_bytes; // effective forward byte limit; donation not included
     int64_t file_cache_bytes;
     double seeking; // current low level seek target, or NOPTS
     int low_level_seeks; // number of started low level seeks

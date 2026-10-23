@@ -48,6 +48,9 @@
 #include "osdep/terminal.h"
 #include "osdep/timer.h"
 #include "stream/stream.h"
+#if HAVE_LIBCURL
+#include "stream/stream_curl.h"
+#endif
 #include "sub/dec_sub.h"
 #include "sub/osd.h"
 #include "video/out/vo.h"
@@ -907,6 +910,39 @@ static void handle_update_cache(struct MPContext *mpctx)
 
     if (s.eof && !busy)
         prefetch_next(mpctx);
+
+#if HAVE_LIBCURL
+    // The transport learns from consumption even while the cache is full or
+    // idle, when the ordinary cache-update timer stops.
+    if (mp_curl_has_streams(mpctx->global)) {
+        if (mpctx->next_curl_update <= now) {
+            mpctx->next_curl_update = now + 0.25;
+            double rates[STREAM_TYPE_COUNT];
+            demux_get_bitrate_stats(mpctx->demuxer, rates);
+            double speed = opts->playback_speed;
+            struct mp_curl_playback_state state = {
+                .buffer_seconds = s.ts_info.duration,
+                .fw_bytes = s.fw_bytes,
+                .max_fw_bytes = s.max_fw_bytes,
+                .speed = speed,
+                // Demuxer rates are bytes per media second.
+                .audio_bitrate = rates[STREAM_AUDIO] >= 0
+                    ? rates[STREAM_AUDIO] * 8 * speed : -1,
+                .video_bitrate = rates[STREAM_VIDEO] >= 0
+                    ? rates[STREAM_VIDEO] * 8 * speed : -1,
+                .idle = s.idle,
+                .underrun = s.underrun,
+                .eof = s.eof,
+                // paused_for_cache is starvation, which the transport must
+                // see as demand, not as the viewer pausing.
+                .user_paused = opts->pause,
+                .seeking = s.seeking != MP_NOPTS_VALUE,
+            };
+            mp_curl_set_playback_state(mpctx->global, &state);
+        }
+        mp_set_timeout(mpctx, mpctx->next_curl_update - now);
+    }
+#endif
 
     if (force_update) {
         mpctx->cache_update_pts = mpctx->playback_pts;

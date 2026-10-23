@@ -414,6 +414,7 @@ typedef struct MPContext {
 
     double last_idle_tick;
     double next_cache_update;
+    double next_curl_update; // next playback state report to the transport
 
     double sleeptime; // number of seconds to sleep before next iteration
 

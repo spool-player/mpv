@@ -211,6 +211,16 @@ struct curl_ctx {
     int64_t thread_cpu_started_ns;
     struct curl_rate ring_wait;
     atomic_int_fast64_t consumer_wait_ns;
+    // Player state handed over without waiting for this thread.
+    mp_mutex state_lock;
+    struct mp_curl_playback_state pending_state;
+    bool state_pending;
+    // Applied on the curl thread. Once the player reports, it owns pause and
+    // buffer state, and curl-transport-control supplies only a bitrate prior.
+    bool player_state;
+    int64_t state_updates;
+    double declared_bitrate;
+    double observed_bitrate;
     atomic_int_fast64_t head_of_line_ns;
     atomic_int_fast64_t peak_reorder_bytes;
     // Worker wake-up lateness past its own deadline; recent is since the
@@ -231,6 +241,7 @@ struct curl_ctx {
     double buffer_seconds;
     uint64_t pause_serial;
     bool playback_paused;
+    bool playback_seeking;
     int64_t paused_ns;
     int64_t pause_started_ns;
     int64_t buffer_generation;
@@ -417,6 +428,7 @@ static void on_done(struct priv *p, CURLcode code);
 static void start_dynamic(struct priv *p);
 static void fill_dynamic(struct priv *p);
 static void open_queue(struct priv *p);
+static void apply_playback_state(struct curl_ctx *ctx);
 static void stop_dynamic(struct priv *p);
 static void on_dynamic_done(struct dynamic_request *request, CURLcode code);
 static void fallback_dynamic(struct priv *p);
@@ -896,6 +908,7 @@ static MP_THREAD_VOID curl_thread(void *arg)
         }
 
         mp_dispatch_queue_process(ctx->dispatch, 0);
+        apply_playback_state(ctx);
 
         // Stop early to avoid delays, this happens only when player is closing.
         if (ctx->exit)
@@ -982,11 +995,13 @@ static void mp_curl_destroy(void *ptr)
     struct cmd c = { .kind = CMD_EXIT, .ctx = ctx };
     mp_dispatch_run(ctx->dispatch, run_cmd, &c);
     mp_thread_join(ctx->thread);
+    mp_mutex_destroy(&ctx->state_lock);
 }
 
 void mp_curl_global_init(struct mpv_global *global)
 {
     struct curl_ctx *ctx = talloc_zero(global, struct curl_ctx);
+    mp_mutex_init(&ctx->state_lock);
     talloc_set_destructor(ctx, mp_curl_destroy);
     ctx->dispatch = mp_dispatch_create(ctx);
     global->curl = ctx;
@@ -1082,6 +1097,10 @@ static void read_metrics(void *arg)
         .peak_reorder_bytes = atomic_load_explicit(&ctx->peak_reorder_bytes,
                                                    memory_order_relaxed),
         .physical_connections = count_connections(ctx),
+        .playback_state_updates = ctx->state_updates,
+        .playback_buffer_seconds = ctx->buffer_seconds,
+        .playback_demand_bitrate = MPMAX(0, ctx->media_bitrate),
+        .playback_user_paused = ctx->playback_paused,
         .recent_lateness_ms = atomic_exchange_explicit(&ctx->recent_lateness_ns,
             0, memory_order_relaxed) / 1e6,
         .peak_lateness_ms = ctx->peak_lateness_ns / 1e6,
@@ -1127,22 +1146,78 @@ struct curl_control {
     int64_t buffer_generation;
 };
 
+static void set_playback_paused(struct curl_ctx *ctx, bool paused)
+{
+    if (ctx->playback_paused != paused) {
+        int64_t now = mp_time_ns();
+        if (paused) {
+            ctx->pause_started_ns = now;
+        } else {
+            ctx->paused_ns += now - ctx->pause_started_ns;
+        }
+        ctx->pause_serial++;
+    }
+    ctx->playback_paused = paused;
+}
+
 static void set_control(void *arg)
 {
     struct curl_control *control = arg;
-    control->ctx->buffer_generation = control->buffer_generation;
-    if (control->ctx->playback_paused != control->paused) {
-        int64_t now = mp_time_ns();
-        if (control->paused) {
-            control->ctx->pause_started_ns = now;
-        } else {
-            control->ctx->paused_ns += now - control->ctx->pause_started_ns;
-        }
-        control->ctx->pause_serial++;
+    struct curl_ctx *ctx = control->ctx;
+    ctx->declared_bitrate = control->media_bitrate;
+    if (ctx->player_state) {
+        ctx->media_bitrate = MPMAX(ctx->observed_bitrate, ctx->declared_bitrate);
+        return;
     }
-    control->ctx->media_bitrate = control->media_bitrate;
-    control->ctx->buffer_seconds = control->buffer_seconds;
-    control->ctx->playback_paused = control->paused;
+    ctx->buffer_generation = control->buffer_generation;
+    set_playback_paused(ctx, control->paused);
+    ctx->media_bitrate = control->media_bitrate;
+    ctx->buffer_seconds = control->buffer_seconds;
+}
+
+// Take the player's latest state. Demand is the larger of observed
+// consumption and the declared media bitrate: a short demuxer window can
+// read below a file's average. A user pause is not a cache pause.
+static void apply_playback_state(struct curl_ctx *ctx)
+{
+    mp_mutex_lock(&ctx->state_lock);
+    bool fresh = ctx->state_pending;
+    struct mp_curl_playback_state state = ctx->pending_state;
+    ctx->state_pending = false;
+    mp_mutex_unlock(&ctx->state_lock);
+    if (!fresh)
+        return;
+    ctx->player_state = true;
+    ctx->state_updates++;
+    ctx->buffer_generation = ctx->state_updates;
+    if (state.seeking != ctx->playback_seeking)
+        ctx->pause_serial++; // a seek invalidates in-flight capacity evidence
+    ctx->playback_seeking = state.seeking;
+    set_playback_paused(ctx, state.user_paused);
+    ctx->buffer_seconds = MPMAX(0, state.buffer_seconds);
+    double observed = MPMAX(0, state.audio_bitrate) +
+                      MPMAX(0, state.video_bitrate);
+    ctx->observed_bitrate = observed;
+    ctx->media_bitrate = MPMAX(observed, ctx->declared_bitrate);
+}
+
+void mp_curl_set_playback_state(struct mpv_global *global,
+                                const struct mp_curl_playback_state *state)
+{
+    if (!global || !global->curl)
+        return;
+    struct curl_ctx *ctx = global->curl;
+    mp_mutex_lock(&ctx->state_lock);
+    ctx->pending_state = *state;
+    ctx->state_pending = true;
+    mp_mutex_unlock(&ctx->state_lock);
+}
+
+bool mp_curl_has_streams(struct mpv_global *global)
+{
+    return global && global->curl &&
+           atomic_load_explicit(&global->curl->active_streams,
+                                memory_order_relaxed) > 0;
 }
 
 void mp_curl_set_control(struct mpv_global *global, double media_bitrate,
@@ -1858,8 +1933,8 @@ static void update_adaptation(struct priv *p)
     }
 
     if (p->opts->adaptive) {
-        double bitrate = ctx->media_bitrate > 0
-            ? ctx->media_bitrate : p->opts->media_bitrate;
+        // The per-file declared bitrate is a floor under measured demand.
+        double bitrate = MPMAX(ctx->media_bitrate, p->opts->media_bitrate);
         double target = bitrate * 1.75 / 8;
         const char *reason = "trial-fewer";
         bool settled = now - p->last_adjustment_ns >= MP_TIME_S_TO_NS(3);
@@ -2042,8 +2117,8 @@ static void fill_dynamic(struct priv *p)
     if (p->startup) {
         int64_t now = mp_time_ns();
         if (!p->startup_end) {
-            double bitrate = p->ctx->media_bitrate > 0
-                ? p->ctx->media_bitrate : p->opts->media_bitrate;
+            double bitrate = MPMAX(p->ctx->media_bitrate,
+                                   p->opts->media_bitrate);
             double remaining_seconds = MPMAX(0,
                 p->opts->startup_buffer_seconds - p->ctx->buffer_seconds);
             uint64_t demand = p->opts->startup_bytes > 0

@@ -2670,6 +2670,19 @@ Property list
         range size and ring size. Active requests can be fewer than the budget.
         Actual speculative segment sizes also obey the memory ceiling.
 
+    ``head-of-line-seconds``, ``peak-reorder-bytes``, ``physical-connections``
+        Ordered-delivery costs of parallel ranges. Head-of-line time is the
+        part of the consumer's wait spent while later bytes were already
+        retained and only the next byte was missing. Peak reorder bytes is the
+        most retained data past the first missing byte. Physical connections
+        counts distinct connections under the active transfers when sampled;
+        multiplexed HTTP/2 streams share one.
+
+    ``recent-scheduling-lateness-ms``, ``peak-scheduling-lateness-ms``
+        How late the curl worker woke past its own deadline: the largest delay
+        since the previous read of this property, and for the core's lifetime.
+        It is CPU scheduling delay, not network latency.
+
     ``stream-id``, ``latency-ms``, ``capacity-bytes-per-second``, ``capacity-samples``
         Monotonic identity of the latest opened stream, estimated first-byte
         latency, and latest eligible capacity estimate/sample count. Capacity

@@ -1737,6 +1737,15 @@ static int mp_property_curl_transport_metrics(void *ctx,
     node_map_add_double(result, "ring-wait-seconds", metrics.ring_wait_seconds);
     node_map_add_double(result, "consumer-wait-seconds",
                         metrics.consumer_wait_seconds);
+    node_map_add_double(result, "head-of-line-seconds",
+                        metrics.head_of_line_seconds);
+    node_map_add_int64(result, "peak-reorder-bytes", metrics.peak_reorder_bytes);
+    node_map_add_int64(result, "physical-connections",
+                       metrics.physical_connections);
+    node_map_add_double(result, "recent-scheduling-lateness-ms",
+                        metrics.recent_lateness_ms);
+    node_map_add_double(result, "peak-scheduling-lateness-ms",
+                        metrics.peak_lateness_ms);
     node_map_add_int64(result, "selected-requests", metrics.selected_requests);
     node_map_add_double(result, "latency-ms", metrics.latency_ms);
     node_map_add_int64(result, "capacity-bytes-per-second",

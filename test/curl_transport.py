@@ -221,6 +221,7 @@ class Origin:
         self.disk = threading.Lock()
         self.next_shared = 0
         self.requests = []
+        self.if_ranges = []
         self.faulted = False
         origin = self
 
@@ -252,6 +253,7 @@ class Origin:
                         origin.fault_range = (start, end)
                     payload, etag = origin.representation()
                     origin.requests.append((start, end))
+                    origin.if_ranges.append(self.headers.get("If-Range"))
                     origin.active += 1
                 guard = origin.disk if origin.serialized else contextlib.nullcontext()
                 try:
@@ -445,7 +447,7 @@ class CurlTransport(unittest.TestCase):
         # ready. Its received prefix must reach playback during the pause
         # instead of waiting for the whole range (or the ranges behind it).
         mib = 1 << 20
-        with Origin(size=8 << 20, latency=0.01, per_lane=4 << 20,
+        with Origin(size=8 << 20, latency=0.01, per_lane=4 << 20, etag='"v1"',
                     pause=(mib + mib // 2, 3.0)) as origin:
             player = Player(LIBRARY, **{"curl-adaptive": "no", "curl-max-request-size": "1MiB",
                                        "curl-buffer-size": "8MiB"})
@@ -489,12 +491,38 @@ class CurlTransport(unittest.TestCase):
             self.assertGreaterEqual(max(connections), 2)
             self.assertLessEqual(max(connections), 4)
 
+    def test_no_validator_withholds_incomplete_range(self):
+        # An exact 206 alone cannot authorize exposing a retriable prefix.
+        # Later completed ranges must not make this incomplete leading one
+        # visible, but completing it must still deliver exact PCM.
+        mib = 1 << 20
+        # Beyond lavf's initial format probe: playback, not probing, is now
+        # requesting this prefix. Lifetime counters include probe re-reads.
+        with Origin(size=10 << 20, latency=0.01, per_lane=4 << 20,
+                    pause=(7 * mib + mib // 2, 3.0)) as origin, tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory) / "actual.pcm"
+            player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
+                                       "ao-pcm-waveheader": "no", "audio-format": "s16",
+                                       "curl-adaptive": "no", "curl-max-request-size": "1MiB",
+                                       "curl-buffer-size": "8MiB"})
+            try:
+                result = player.play(origin.url)
+            finally:
+                player.close()
+            self.assertIsNotNone(origin.pause_window)
+            paused, resumed = origin.pause_window
+            during = [position for at, position in result["positions"]
+                      if paused + 1.0 <= at <= resumed - 0.2]
+            self.assertTrue(during, "playback reached the incomplete leading range")
+            self.assertLessEqual(max(during), (7 * mib - 44) / 192000 + 0.1)
+            self.assertEqual(output.read_bytes(), origin.pcm)
+
     def test_seek_during_partial_publication_delivers_exact_bytes(self):
         # Seek while one range is half published and later ranges are
         # retained: the queue is torn down mid-flight, and everything played
         # after the seek must be exactly the file from the seek target on.
         mib = 1 << 20
-        with Origin(size=6 << 20, latency=0.01, per_lane=4 << 20,
+        with Origin(size=6 << 20, latency=0.01, per_lane=4 << 20, etag='"v1"',
                     pause=(mib + mib // 2, 3.0)) as origin, tempfile.TemporaryDirectory() as directory:
             output = pathlib.Path(directory) / "actual.pcm"
             player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output, "ao-pcm-waveheader": "no",
@@ -519,9 +547,9 @@ class CurlTransport(unittest.TestCase):
             self.assertTrue(output.read_bytes().endswith(tail))
 
     def test_retry_resumes_or_verifies_published_prefix(self):
-        # A range truncated after its prefix was published is completed from
-        # its suffix under a strong validator, or re-read in full and verified
-        # without one. Either way playback receives every byte exactly once.
+        # A strong validator permits suffix retry; without one the incomplete
+        # descriptor remains hidden and is re-read in full. Every byte still
+        # reaches playback exactly once.
         for etag in ('"v1"', None):
             with self.subTest(etag=etag), Origin(size=2 << 20, fault="truncate", etag=etag,
                                                  fault_after=512 << 10) as origin, \
@@ -541,6 +569,8 @@ class CurlTransport(unittest.TestCase):
                 if etag:
                     self.assertIn(middle, starts)
                     self.assertEqual(starts.count(start), 1)
+                    retried = next(index for index, (first, _) in enumerate(origin.requests) if first == middle)
+                    self.assertEqual(origin.if_ranges[retried], etag)
                 else:
                     self.assertNotIn(middle, starts)
                     self.assertEqual(starts.count(start), 2)

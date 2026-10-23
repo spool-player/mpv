@@ -70,6 +70,7 @@ struct mp_curl_concurrency_metrics {
 struct mp_curl_stream_metrics {
     int64_t id;
     int64_t readable_bytes, retained_bytes, reorder_bytes;
+    bool prefix_publication_available;
 };
 
 struct mp_curl_connection_metrics {

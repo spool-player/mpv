@@ -352,6 +352,7 @@ struct range_desc {
     // Protected by priv.mtx.
     size_t published;     // bytes the consumer may read, <= received
     size_t consumed;      // bytes the consumer has taken
+    size_t retained; // received snapshot under mtx, including hidden bytes
     bool complete;        // every byte is published
     int protocol_index; // protocol which supplied this range's fresh bytes
 };
@@ -383,6 +384,7 @@ struct priv {
     CURL *curl;
     struct curl_handle_ref primary_ref;
     struct curl_slist *headers;
+    struct curl_slist *range_headers; // shared by dynamic handles; owns If-Range
     char *url;
     const struct curl_scheme *scheme;
 
@@ -520,7 +522,20 @@ static uint64_t stream_readable(struct priv *p)
 
 static uint64_t stream_reorder(struct priv *p)
 {
-    return p->queued_bytes ? p->queued_bytes - (p->ordered_pos - p->queue_pos) : 0;
+    uint64_t bytes = p->queued_bytes ? p->queued_bytes - (p->ordered_pos - p->queue_pos) : 0;
+    // Without a strong validator the leading range's received prefix is
+    // deliberately hidden until completion, not reordered behind a gap.
+    if (!p->etag) {
+        for (int n = 0; n < p->range_count; n++) {
+            const struct range_desc *range = &p->ranges[(p->range_head + n) % p->num_ranges];
+            if (range->end <= p->ordered_pos)
+                continue;
+            if (range->start <= p->ordered_pos)
+                bytes -= range->retained - range->published;
+            break;
+        }
+    }
+    return bytes;
 }
 
 static void update_gap(struct priv *p, int64_t now)
@@ -1656,6 +1671,7 @@ static void read_metrics(void *arg)
                 .readable_bytes = readable,
                 .retained_bytes = retained,
                 .reorder_bytes = reorder,
+                .prefix_publication_available = p->etag != NULL,
             };
         } else {
             metrics->snapshot_truncated = true;
@@ -1982,16 +1998,17 @@ static uint64_t advance_ordered(struct priv *p)
     return p->ordered_pos - before;
 }
 
-// Make a range's stored prefix readable. Any validated prefix may be
-// published: a retry either resumes after it under the same strong validator
-// or re-reads it and must reproduce it byte for byte.
-static void publish_range(struct priv *p, struct range_desc *range, int64_t now)
+// Strong validators authorize prefix publication and exact suffix retry.
+// Otherwise retain the body privately until libcurl confirms completion.
+static void publish_range(struct priv *p, struct range_desc *range, int64_t now, bool finished)
 {
     mp_mutex_lock(&p->mtx);
     int64_t old_reorder = stream_reorder(p);
-    p->queued_bytes += range->received - range->published;
-    range->published = range->received;
-    range->complete = range->received == range->end - range->start;
+    p->queued_bytes += range->received - range->retained;
+    range->retained = range->received;
+    if (p->etag || finished)
+        range->published = range->received;
+    range->complete = range->received == range->end - range->start && (p->etag || finished);
     uint64_t ordered = advance_ordered(p);
     p->ctx->ordered_bytes += ordered;
     p->ctx->reorder_bytes += (int64_t)stream_reorder(p) - old_reorder;
@@ -2039,7 +2056,7 @@ static size_t dynamic_write_callback(char *ptr, size_t size, size_t nmemb,
     request->fetch_pos = pos + bytes;
     if (request->fetch_pos > range->received) {
         range->received = request->fetch_pos;
-        publish_range(p, range, now);
+        publish_range(p, range, now, false);
     }
     return bytes;
 }
@@ -2100,11 +2117,12 @@ static size_t dynamic_header_callback(char *buffer, size_t size, size_t nitems,
     uint64_t start = 0;
     uint64_t end = 0;
     int64_t total = -1;
-    // A resumed suffix is only spliced onto published bytes under the same
-    // strong validator; a fresh or re-read range may omit it.
+    // Every range belongs to the primary's representation. Once a strong
+    // validator is known, its omission is not permission to splice bytes.
     const char *etag = header_value(request->curl, "ETag");
-    bool same_entity = !p->etag ||
-        (etag ? strcmp(etag, p->etag) == 0 : request->fetch_pos == 0);
+    bool same_entity = !p->etag || (etag && strcmp(etag, p->etag) == 0);
+    if (!same_entity || (resp == 200 && request->fetch_pos > 0))
+        request->changed = true;
     bool valid =
         resp == 206 &&
         parse_exact_content_range(header_value(request->curl, "Content-Range"),
@@ -2303,10 +2321,10 @@ static void validate_http_response(struct priv *p, struct bstr line)
     // Servers may cap a reply short of the requested range; on_done()
     // continues from where it stopped.
     p->reply_ranged = resp == 206;
-    // Continuations append to delivered bytes; a different strong validator
-    // means a different file. Servers that omit it on a reply cannot be told.
+    // Continuations must retain the primary's strong validator. Its omission
+    // cannot authorize appending an unverified representation either.
     const char *etag = header_value(p->curl, "ETag");
-    bool same_entity = !p->etag || !etag || strcmp(etag, p->etag) == 0;
+    bool same_entity = !p->etag || (etag && strcmp(etag, p->etag) == 0);
     bool valid =
         same_entity && is_http_success(resp) &&
         (!p->seekable ||
@@ -2674,6 +2692,7 @@ static struct range_desc *queue_next_range(struct priv *p)
         range->end = p->next_schedule + MPMIN(bytes, limit - p->next_schedule);
         range->published = 0;
         range->consumed = 0;
+        range->retained = 0;
         range->complete = false;
     }
     mp_mutex_unlock(&p->mtx);
@@ -2810,6 +2829,8 @@ static void stop_dynamic(struct priv *p)
         if (request->curl)
             curl_easy_cleanup(request->curl);
     }
+    curl_slist_free_all(p->range_headers);
+    p->range_headers = NULL;
     talloc_free(p->range_data);
     talloc_free(p->ranges);
     talloc_free(p->requests);
@@ -2819,6 +2840,35 @@ static void stop_dynamic(struct priv *p)
     p->num_ranges = 0;
     p->num_requests = 0;
     p->dynamic_started = false;
+}
+
+static bool prepare_range_headers(struct priv *p)
+{
+    if (!p->etag)
+        return true;
+    struct curl_slist *headers = NULL;
+    for (struct curl_slist *h = p->headers; h; h = h->next) {
+        // The transport owns the validator for these exact byte ranges.
+        if (strncasecmp(h->data, "If-Range:", 9) == 0)
+            continue;
+        struct curl_slist *next = curl_slist_append(headers, h->data);
+        if (!next)
+            goto fail;
+        headers = next;
+    }
+    char *condition = talloc_asprintf(NULL, "If-Range: %s", p->etag);
+    if (!condition)
+        goto fail;
+    struct curl_slist *next = curl_slist_append(headers, condition);
+    talloc_free(condition);
+    if (!next)
+        goto fail;
+    p->range_headers = next;
+    return true;
+
+fail:
+    curl_slist_free_all(headers);
+    return false;
 }
 
 static void start_dynamic(struct priv *p)
@@ -2875,6 +2925,12 @@ static void start_dynamic(struct priv *p)
     p->queue_open = false;
     mp_mutex_unlock(&p->mtx);
     p->dynamic_started = true;
+    if (!prepare_range_headers(p)) {
+        MP_WARN(p, "could not allocate parallel range headers\n");
+        p->dynamic_supported = false;
+        stop_dynamic(p);
+        return;
+    }
 
     for (int n = 0; n < count; n++) {
         struct dynamic_request *request = &p->requests[n];
@@ -2889,6 +2945,8 @@ static void start_dynamic(struct priv *p)
             return;
         }
         setup_curl(p, request->curl);
+        if (p->range_headers)
+            curl_easy_setopt(request->curl, CURLOPT_HTTPHEADER, p->range_headers);
         curl_easy_setopt(request->curl, CURLOPT_PRIVATE, &request->ref);
         curl_easy_setopt(request->curl, CURLOPT_WRITEFUNCTION,
                          dynamic_write_callback);
@@ -2955,15 +3013,17 @@ static void on_dynamic_done(struct dynamic_request *request, CURLcode code)
     request->range = NULL;
     if (!range)
         return;
-    range->request = NULL;
     size_t expected = range->end - range->start;
     if (code == CURLE_OK && request->response_ok &&
         request->fetch_pos == expected && !aborted)
     {
+        publish_range(p, range, mp_time_ns(), true);
+        range->request = NULL;
         fill_dynamic(p);
         check_dynamic_eof(p);
         return;
     }
+    range->request = NULL;
 
     if (request->changed) {
         // Bytes already delivered no longer match the server's file.
@@ -3185,7 +3245,8 @@ static void setup_curl(struct priv *p, CURL *c)
     curl_easy_setopt(c, CURLOPT_HTTP_VERSION, (long)p->opts->http_version);
     curl_easy_setopt(c, CURLOPT_HSTS_CTRL, (long)CURLHSTS_ENABLE);
     curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
-    // libcurl's 16 KiB default costs one body callback (and recv) per 16 KiB.
+    // Larger reads may reduce receive calls. Curl still splits body output
+    // at CURL_MAX_WRITE_SIZE; this does not enlarge write callbacks.
     curl_easy_setopt(c, CURLOPT_BUFFERSIZE, (long)p->opts->read_size);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS,
                      (long)(p->opts->connect_timeout * 1000));

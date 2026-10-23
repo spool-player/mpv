@@ -202,6 +202,10 @@ struct curl_ctx {
     atomic_uint_fast64_t failed_requests;
     atomic_uint_fast64_t retry_attempts;
     struct curl_rate traffic;
+    int64_t thread_started_ns;
+    int64_t thread_cpu_started_ns;
+    struct curl_rate ring_wait;
+    atomic_int_fast64_t consumer_wait_ns;
     struct curl_rate lanes[MP_CURL_MAX_LANES];
     int64_t lane_capacity[MP_CURL_MAX_LANES];
     int64_t lane_samples[MP_CURL_MAX_LANES];
@@ -302,11 +306,14 @@ struct priv {
     int selected_requests;
     int previous_requests;
     int rejected_requests;
+    double rejected_capacity;
+    int64_t rejected_ns;
+    int rejected_lower_requests;
+    double rejected_lower_capacity;
+    int64_t rejected_lower_ns;
     int64_t stream_id;
     size_t segment_size;
-    size_t range_size;
     double latency_ms;
-    double capacity;
     double previous_capacity;
     uint64_t phase_bytes;
     uint64_t phase_delivered;
@@ -320,6 +327,7 @@ struct priv {
     int learning_active;
     int64_t learning_updated_ns;
     int64_t phase_active_ns;
+    bool ring_waiting; // curl-thread accounting, independent of resume commands
     bool startup;
     uint64_t startup_start;
     uint64_t startup_end;
@@ -406,6 +414,22 @@ static void rate_stop(struct curl_rate *rate, int64_t now)
     rate->active_ns += rate->users * (now - rate->active_started_ns);
     rate->users--;
     rate->active_started_ns = now;
+}
+
+static void begin_ring_wait(struct priv *p, int64_t now)
+{
+    if (!p->ring_waiting) {
+        p->ring_waiting = true;
+        rate_start(&p->ctx->ring_wait, now);
+    }
+}
+
+static void end_ring_wait(struct priv *p)
+{
+    if (p->ring_waiting) {
+        p->ring_waiting = false;
+        rate_stop(&p->ctx->ring_wait, mp_time_ns());
+    }
 }
 
 static void rate_add(struct curl_rate *rate, size_t bytes, int64_t now)
@@ -596,7 +620,8 @@ static void run_cmd(void *arg)
         c->p->startup_buffer_generation = ctx->buffer_generation;
         ctx->stream_id = c->p->stream_id;
         ctx->selected_requests = c->p->selected_requests;
-        ctx->capacity = 0;
+        // Seed only the summary; learned concurrency points require real data.
+        ctx->capacity = c->p->opts->observed_bps;
         ctx->capacity_samples = 0;
         ctx->latency_ms = c->p->latency_ms;
         memset(ctx->concurrency, 0, sizeof(ctx->concurrency));
@@ -606,6 +631,7 @@ static void run_cmd(void *arg)
         start_request(c->p);
         break;
     case CMD_REMOVE:
+        end_ring_wait(c->p);
         stop_dynamic(c->p);
         if (c->p->active) {
             MP_TRACE(c->p, "removing curl handle\n");
@@ -615,6 +641,7 @@ static void run_cmd(void *arg)
         }
         break;
     case CMD_UNPAUSE:
+        end_ring_wait(c->p);
         // The consumer freed enough buffer space. Clear the pause flag and
         // resume the transfer.
         mp_mutex_lock(&c->p->mtx);
@@ -625,6 +652,7 @@ static void run_cmd(void *arg)
         curl_easy_pause(c->p->curl, CURLPAUSE_CONT);
         break;
     case CMD_SEEK:
+        end_ring_wait(c->p);
         stop_dynamic(c->p);
         MP_TRACE(c->p, "seeking to %" PRIu64 "\n", c->pos);
         if (c->p->active) {
@@ -654,6 +682,7 @@ static void run_cmd(void *arg)
         c->p->learning_updated_ns = 0;
         c->p->previous_requests = 0;
         c->p->rejected_requests = 0;
+        c->p->rejected_lower_requests = 0;
         c->p->startup = c->p->opts->adaptive &&
                          c->p->opts->max_request_size > 0;
         c->p->startup_end = 0;
@@ -670,6 +699,7 @@ static void run_cmd(void *arg)
         start_dynamic(c->p);
         break;
     case CMD_PUMP:
+        end_ring_wait(c->p);
         pump_dynamic(c->p);
         break;
     case CMD_FALLBACK_DYNAMIC:
@@ -726,6 +756,9 @@ static MP_THREAD_VOID curl_thread(void *arg)
 {
     mp_thread_set_name("curl");
     struct curl_ctx *ctx = arg;
+    ctx->thread_started_ns = mp_time_ns();
+    ctx->thread_cpu_started_ns =
+        mp_thread_cpu_time_ns(mp_thread_current_id());
 
     CURLcode res = curl_global_init(CURL_GLOBAL_ALL);
     if (res == CURLE_OK) {
@@ -837,6 +870,9 @@ static void read_metrics(void *arg)
     struct curl_ctx *ctx = snapshot->ctx;
     struct mp_curl_metrics *metrics = snapshot->metrics;
     int64_t now = mp_time_ns();
+    int64_t cpu = mp_thread_cpu_time_ns(mp_thread_current_id());
+    bool cpu_available = cpu >= 0 &&
+                         cpu >= MPMAX(ctx->thread_cpu_started_ns, 0);
     double elapsed = ctx->traffic.started_ns
         ? MP_TIME_NS_TO_S(now - ctx->traffic.started_ns) : 0;
     int64_t current = rate_current(&ctx->traffic, now);
@@ -872,6 +908,15 @@ static void read_metrics(void *arg)
         .peak_received_bytes_per_second = ctx->traffic.peak,
         .current_received_bytes_per_second = current,
         .elapsed_seconds = elapsed,
+        .curl_thread_cpu_seconds = cpu_available
+            ? MP_TIME_NS_TO_S(cpu - MPMAX(ctx->thread_cpu_started_ns, 0)) : 0,
+        .curl_thread_wall_seconds =
+            MP_TIME_NS_TO_S(now - ctx->thread_started_ns),
+        .curl_thread_cpu_available = cpu_available,
+        .ring_wait_seconds = MP_TIME_NS_TO_S(ctx->ring_wait.active_ns +
+            ctx->ring_wait.users * (now - ctx->ring_wait.active_started_ns)),
+        .consumer_wait_seconds = MP_TIME_NS_TO_S(atomic_load_explicit(
+            &ctx->consumer_wait_ns, memory_order_relaxed)),
         .selected_requests = ctx->selected_requests,
         .latency_ms = ctx->latency_ms,
         .capacity_bytes_per_second = ctx->capacity,
@@ -986,7 +1031,9 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
 
     if (p->buffer_size - p->count < bytes) {
         // No room in the buffer. Pause the transfer and wait for the consumer.
-        learning_tick(p, mp_time_ns());
+        int64_t now = mp_time_ns();
+        learning_tick(p, now);
+        begin_ring_wait(p, now);
         p->paused = true;
         p->paused_bytes = bytes;
         p->primary_ref.blocked = true;
@@ -1475,9 +1522,9 @@ static void start_request(struct priv *p)
                 // extra small request taxes high-latency origins needlessly.
                 uint64_t demand = p->opts->startup_bytes > 0
                     ? p->opts->startup_bytes
-                    : p->latency_ms >= 100 ? p->range_size : 64 * 1024;
+                    : p->latency_ms >= 100 ? p->segment_size : 64 * 1024;
                 uint64_t leading = p->latency_ms >= 100 || demand > 64 * 1024
-                    ? MPMIN(p->range_size, demand) : 64 * 1024;
+                    ? MPMIN(p->segment_size, demand) : 64 * 1024;
                 bytes = MPMIN(bytes, leading);
             }
             end = bytes - 1 > UINT64_MAX - start
@@ -1564,40 +1611,69 @@ static void update_adaptation(struct priv *p)
         ctx->capacity_samples = ++p->capacity_samples;
         ctx->latency_ms = p->latency_ms;
     }
-    p->capacity = capacity;
 
     if (p->opts->adaptive) {
         double bitrate = ctx->media_bitrate > 0
             ? ctx->media_bitrate : p->opts->media_bitrate;
         double target = bitrate * 1.75 / 8;
+        const char *reason = "trial-fewer";
         bool settled = now - p->last_adjustment_ns >= MP_TIME_S_TO_NS(3);
-        if (now - p->last_adjustment_ns >= MP_TIME_S_TO_NS(30))
+        // Retry rejected counts only after capacity changes materially,
+        // not on a timer at an unchanged CPU/server bottleneck.
+        if (now - p->rejected_ns >= MP_TIME_S_TO_NS(30) &&
+            (capacity < p->rejected_capacity * 0.67 ||
+             capacity > p->rejected_capacity * 1.5))
+        {
             p->rejected_requests = 0;
+        }
+        if (now - p->rejected_lower_ns >= MP_TIME_S_TO_NS(30) &&
+            (capacity < p->rejected_lower_capacity * 0.67 ||
+             capacity > p->rejected_lower_capacity * 1.5))
+        {
+            p->rejected_lower_requests = 0;
+        }
+        bool can_increase = selected < p->opts->parallel_requests &&
+                            selected + 1 != p->rejected_requests;
+        bool can_decrease = selected > 1 &&
+                            selected - 1 != p->rejected_lower_requests;
         if (p->previous_requests) {
             bool increased = selected > p->previous_requests;
             bool useful = increased
-                ? (capacity > p->previous_capacity * 1.12 ||
-                   (target > 0 && capacity >= target)) &&
+                ? capacity > p->previous_capacity * 1.12 &&
                   p->phase_delivered >= p->phase_bytes / 2
-                : capacity >= target && target > 0;
+                : capacity >= p->previous_capacity * 0.90 ||
+                  (target > 0 && capacity >= target);
             if (!useful) {
-                if (increased)
+                reason = increased ? "reject-no-gain" : "restore-capacity";
+                if (increased) {
                     p->rejected_requests = selected;
+                    p->rejected_capacity = p->previous_capacity;
+                    p->rejected_ns = now;
+                } else {
+                    p->rejected_lower_requests = selected;
+                    p->rejected_lower_capacity = p->previous_capacity;
+                    p->rejected_lower_ns = now;
+                }
                 selected = p->previous_requests;
+            } else if (!increased) {
+                // A lower count retained comparable (or sufficient) capacity.
+                // Do not immediately climb back into the discarded count.
+                p->rejected_requests = p->previous_requests;
+                p->rejected_capacity = capacity;
+                p->rejected_ns = now;
             }
             p->previous_requests = 0;
             p->last_adjustment_ns = now;
-        } else if (settled && target > 0 && capacity < target &&
-                   selected < p->opts->parallel_requests &&
-                   selected + 1 != p->rejected_requests)
+        } else if (settled && target > 0 && capacity < target && can_increase)
         {
+            reason = "trial-more";
             p->previous_requests = selected;
             p->previous_capacity = capacity;
             selected++;
             p->last_adjustment_ns = now;
-        } else if (target > 0 && selected > 1 && capacity >= target &&
-                   ctx->buffer_seconds >= 3 &&
-                   now - p->last_adjustment_ns >= MP_TIME_S_TO_NS(15))
+        } else if (can_decrease &&
+                   (target <= 0 || capacity >= target || !can_increase) &&
+                   now - p->last_adjustment_ns >= MP_TIME_S_TO_NS(6))
         {
             p->previous_requests = selected;
             p->previous_capacity = capacity;
@@ -1605,22 +1681,10 @@ static void update_adaptation(struct priv *p)
             p->last_adjustment_ns = now;
         }
         if (selected != p->selected_requests) {
-            MP_VERBOSE(p, "adaptive request lanes: %d -> %d\n",
-                       p->selected_requests, selected);
+            MP_INFO(p, "adaptive request lanes: %d -> %d (%s, "
+                       "capacity %.0f bytes/s, target %.0f bytes/s)\n",
+                    p->selected_requests, selected, reason, capacity, target);
             p->selected_requests = selected;
-            p->generation++;
-            p->transitioning = p->learning_active;
-        }
-        // Amortize observed first-byte latency without making the ordered
-        // leading range huge. A fixed preallocated segment ceiling bounds it.
-        double wanted = capacity / selected *
-            MPMAX(0.25, p->latency_ms / 1000 * 2);
-        size_t range = MPCLAMP(wanted, MPMIN(256 * 1024, p->segment_size),
-                              p->segment_size);
-        if (!p->previous_requests && selected == p->selected_requests &&
-            (range < p->range_size * 3 / 4 || range > p->range_size * 5 / 4))
-        {
-            p->range_size = range;
             p->generation++;
             p->transitioning = p->learning_active;
         }
@@ -1637,7 +1701,10 @@ static bool schedule_dynamic_request(struct dynamic_request *request)
     if (request->scheduled || p->next_schedule >= limit)
         return false;
 
-    uint64_t bytes = p->range_size;
+    // Full preallocated segments amortize range/header/TLS bookkeeping.
+    // Shrinking ranges as throughput falls compounds slow-client overhead
+    // and changes the workload in the middle of concurrency comparisons.
+    uint64_t bytes = p->segment_size;
     if (p->startup) {
         if (p->next_schedule >= p->startup_end)
             return false;
@@ -1723,7 +1790,10 @@ static void fill_dynamic(struct priv *p)
     mp_mutex_lock(&p->mtx);
     bool space = p->count < p->buffer_size * 3 / 4;
     if (!space)
+    {
         p->dynamic_waiting = true;
+        begin_ring_wait(p, mp_time_ns());
+    }
     mp_mutex_unlock(&p->mtx);
     if (!space)
         return;
@@ -1737,6 +1807,7 @@ static void fill_dynamic(struct priv *p)
 
 static void stop_dynamic(struct priv *p)
 {
+    end_ring_wait(p);
     for (int n = 0; n < p->num_requests; n++) {
         struct dynamic_request *request = &p->requests[n];
         if (request->active) {
@@ -1869,6 +1940,7 @@ static void pump_dynamic(struct priv *p)
         }
         if (copy == 0) {
             p->dynamic_waiting = true;
+            begin_ring_wait(p, mp_time_ns());
         }
         mp_mutex_unlock(&p->mtx);
 
@@ -1887,6 +1959,7 @@ static void pump_dynamic(struct priv *p)
         p->finished = true;
         mp_mutex_lock(&p->mtx);
         p->stream_eof = true;
+        end_ring_wait(p);
         p->dynamic_waiting = false;
         mp_cond_broadcast(&p->cond);
         mp_mutex_unlock(&p->mtx);
@@ -2211,7 +2284,11 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
     while (p->count == 0 && !p->stream_eof && !p->stream_error &&
            !atomic_load_explicit(&p->aborted, memory_order_relaxed))
     {
+        int64_t started = mp_time_ns();
         mp_cond_wait(&p->cond, &p->mtx);
+        atomic_fetch_add_explicit(&p->ctx->consumer_wait_ns,
+                                  mp_time_ns() - started,
+                                  memory_order_relaxed);
     }
 
     size_t copy = MPMIN((size_t)max_len, p->count);
@@ -2338,17 +2415,9 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
         : p->opts->parallel_requests;
     p->startup = p->opts->adaptive && p->opts->max_request_size > 0;
     p->latency_ms = p->opts->latency_ms;
-    p->capacity = p->opts->observed_bps;
     // Speculative memory is one ring, not max-request-size times the cap.
     p->segment_size = MPMIN(p->opts->max_request_size,
                            p->buffer_size / p->opts->parallel_requests);
-    p->range_size = p->segment_size;
-    if (p->opts->adaptive && p->capacity > 0 && p->latency_ms > 0) {
-        double wanted = p->capacity / p->selected_requests *
-            MPMAX(0.25, p->latency_ms / 1000 * 2);
-        p->range_size = MPCLAMP(wanted, MPMIN(256 * 1024, p->segment_size),
-                               p->segment_size);
-    }
     p->buffer = talloc_size(p, p->buffer_size);
     p->icy = mp_icy_new(p);
 

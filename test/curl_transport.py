@@ -182,7 +182,7 @@ class Player:
 class Origin:
     def __init__(self, size=8 << 20, latency=0.04, per_lane=2 << 20,
                  shared=0, serialized=False, reorder=False, fault=None,
-                 cap=0, unknown_size=False):
+                 cap=0, unknown_size=False, contention=False):
         pcm = (bytes(range(256)) * ((size + 255) // 256))[:size - size % 4]
         self.pcm = pcm
         self.payload = (b"RIFF" + struct.pack("<I", len(pcm) + 36) + b"WAVEfmt " +
@@ -191,6 +191,8 @@ class Origin:
         self.latency, self.per_lane, self.shared = latency, per_lane, shared
         self.serialized, self.reorder, self.fault = serialized, reorder, fault
         self.cap, self.unknown_size = cap, unknown_size
+        self.contention = contention
+        self.active = 0
         self.lock = threading.Lock()
         self.disk = threading.Lock()
         self.next_shared = 0
@@ -221,6 +223,7 @@ class Origin:
                     inject = bool(origin.fault and not origin.faulted and start > 0)
                     origin.faulted |= inject
                     origin.requests.append((start, end))
+                    origin.active += 1
                 guard = origin.disk if origin.serialized else contextlib.nullcontext()
                 try:
                     with guard:
@@ -245,7 +248,11 @@ class Origin:
                                     origin.next_shared = deadline_shared + len(block) / origin.shared
                                 time.sleep(max(0, deadline_shared - time.monotonic()))
                             if origin.per_lane:
-                                deadline += len(block) / origin.per_lane
+                                with origin.lock:
+                                    # Model an origin/client whose aggregate
+                                    # capacity falls with concurrent requests.
+                                    penalty = origin.active ** 2 if origin.contention else 1
+                                deadline += len(block) * penalty / origin.per_lane
                                 time.sleep(max(0, deadline - time.monotonic()))
                             self.wfile.write(block)
                             self.wfile.flush()
@@ -257,6 +264,9 @@ class Origin:
                             self.close_connection = True
                 except (BrokenPipeError, ConnectionResetError):
                     pass
+                finally:
+                    with origin.lock:
+                        origin.active -= 1
 
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
@@ -323,6 +333,15 @@ class CurlTransport(unittest.TestCase):
                 idle = current.get("curl-transport-metrics")
                 self.assertEqual(idle["received-bytes"], settled["received-bytes"])
                 self.assertEqual(idle["current-received-bytes-per-second"], 0)
+                self.assertGreater(idle["ring-wait-seconds"] -
+                                   settled["ring-wait-seconds"], 1)
+                self.assertGreater(idle["curl-thread-wall-seconds"],
+                                   settled["curl-thread-wall-seconds"])
+                if idle["curl-thread-cpu-available"]:
+                    self.assertGreaterEqual(idle["curl-thread-cpu-seconds"],
+                                            settled["curl-thread-cpu-seconds"])
+                    self.assertLessEqual(idle["curl-thread-cpu-seconds"],
+                                         idle["curl-thread-wall-seconds"])
                 observed["before-seek"] = idle["received-bytes"]
                 current.command("seek", "2", "absolute+exact")
                 current.control(paused=False)
@@ -332,9 +351,13 @@ class CurlTransport(unittest.TestCase):
                 first = player.play(origin.url, loaded=pause_seek_resume)["metrics"]
                 self.assertGreaterEqual(first["received-bytes"], observed["before-seek"])
                 self.assertEqual(first["retry-attempts"], 0)
+                self.assertGreater(first["consumer-wait-seconds"], 0)
                 second = player.play(origin.url)["metrics"]
                 self.assertGreater(second["received-bytes"], first["received-bytes"])
                 self.assertGreater(second["stream-id"], first["stream-id"])
+                for key in ("curl-thread-wall-seconds", "ring-wait-seconds",
+                            "consumer-wait-seconds"):
+                    self.assertGreaterEqual(second[key], first[key])
             finally:
                 player.close()
 
@@ -396,6 +419,61 @@ class CurlTransport(unittest.TestCase):
                     self.assertTrue(any(point["requests"] == 2 for point in points))
                 finally:
                     player.close()
+
+    def test_negative_scaling_downshifts_even_below_demand(self):
+        # A learned high count must decay even when no count can satisfy the
+        # bitrate target. The real HTTP origin is slower with more requests.
+        with Origin(size=24 << 20, latency=0.02, per_lane=1 << 20,
+                    contention=True) as origin:
+            player = Player(LIBRARY, **{"curl-initial-requests": "4",
+                                       "curl-startup-requests": "1",
+                                       "curl-media-bitrate": "48000000"})
+            try:
+                result = player.play(origin.url)
+                metrics = result["metrics"]
+                points = {point["requests"]: point["capacity-bytes-per-second"]
+                          for point in metrics["concurrency-samples"]}
+                self.assertIn(4, points)
+                self.assertIn(1, points)
+                self.assertGreater(points[1], points[4] * 1.15)
+                self.assertLess(points[1], 48000000 * 1.75 / 8)
+                self.assertEqual(metrics["selected-requests"], 1)
+            finally:
+                player.close()
+
+    def test_rejected_downshift_does_not_repeat_below_demand(self):
+        # Two lanes are useful but cannot meet headroom. Once a one-lane
+        # trial loses capacity, an unchanged origin must not be retried every
+        # six seconds, repeatedly starving the consumer.
+        with Origin(size=24 << 20, latency=0.02, per_lane=512 << 10) as origin:
+            player = Player(LIBRARY, **{"curl-parallel-requests": "2",
+                                       "curl-initial-requests": "2",
+                                       "curl-startup-requests": "1",
+                                       "curl-media-bitrate": "48000000"})
+            try:
+                result = player.play(origin.url)
+                metrics = result["metrics"]
+                points = {point["requests"]: point["capacity-bytes-per-second"]
+                          for point in metrics["concurrency-samples"]}
+                self.assertIn(1, points)
+                self.assertIn(2, points)
+                self.assertGreater(points[2], points[1] * 1.15)
+                self.assertLess(points[2], 48000000 * 1.75 / 8)
+                transitions = []
+                for elapsed, sample in result["samples"]:
+                    choice = sample["selected-requests"]
+                    if not transitions or choice != transitions[-1][1]:
+                        transitions.append((elapsed, choice))
+                downshifts = [elapsed for (_previous_time, previous), (elapsed, choice)
+                              in zip(transitions, transitions[1:])
+                              if previous == 2 and choice == 1]
+                self.assertEqual(len(downshifts), 1)
+                restored = next(elapsed for elapsed, choice in transitions
+                                if elapsed > downshifts[0] and choice == 2)
+                self.assertGreater(result["seconds"] - restored, 8)
+                self.assertEqual(metrics["selected-requests"], 2)
+            finally:
+                player.close()
 
     def test_cached_bursts_still_learn_and_downshift(self):
         # A timed consumer spends most wall time with a full ring. Capacity

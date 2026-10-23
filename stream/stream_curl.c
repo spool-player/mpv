@@ -251,9 +251,12 @@ struct curl_ctx {
     mp_mutex state_lock;
     struct mp_curl_playback_state pending_state;
     bool state_pending;
-    // Applied on the curl thread. Once the player reports, it owns pause and
-    // buffer state, and curl-transport-control supplies only a bitrate prior.
-    bool player_state;
+    // Applied on the curl thread. The player owns pause and buffer state;
+    // the host's control supplies facts and live host state.
+    int64_t epoch;
+    struct mp_curl_control configured;
+    int64_t stale_controls, rejected_controls;
+    bool background_network;
     int64_t state_updates;
     double declared_bitrate;
     double observed_bitrate;
@@ -299,6 +302,7 @@ struct curl_handle_ref {
     uint64_t received;
     bool blocked;
     bool measuring;
+    bool foreign; // other traffic shared the link during the measurement
     uint64_t pause_serial;
     uint64_t generation;
 };
@@ -465,6 +469,7 @@ static void start_dynamic(struct priv *p);
 static void fill_dynamic(struct priv *p);
 static void open_queue(struct priv *p);
 static void apply_playback_state(struct curl_ctx *ctx);
+static bool foreign_traffic(struct curl_ctx *ctx);
 static void stop_dynamic(struct priv *p);
 static void on_dynamic_done(struct dynamic_request *request, CURLcode code);
 static void fallback_dynamic(struct priv *p);
@@ -561,6 +566,7 @@ static void begin_measurement(struct curl_handle_ref *ref)
     ref->received = 0;
     ref->blocked = false;
     ref->measuring = true;
+    ref->foreign = foreign_traffic(p->ctx);
     ref->pause_serial = p->ctx->pause_serial;
     ref->generation = p->generation;
     rate_start(&p->ctx->traffic, now);
@@ -585,7 +591,8 @@ static void end_measurement(struct curl_handle_ref *ref, bool succeeded)
     rate_stop(&ctx->lanes[ref->lane], now);
     // Capacity includes setup, TTFB and server stalls, but a deliberately
     // paused request is not evidence of low server capacity.
-    if (succeeded && !ref->blocked && !ctx->playback_paused &&
+    ref->foreign |= foreign_traffic(ctx);
+    if (succeeded && !ref->blocked && !ref->foreign && !ctx->playback_paused &&
         ref->pause_serial == ctx->pause_serial &&
         ref->generation == p->generation &&
         ref->received && now > ref->started_ns)
@@ -629,6 +636,17 @@ static void record_received_bytes(struct curl_handle_ref *ref, size_t bytes)
 
 static void setup_curl(struct priv *p, CURL *curl);
 
+// Transfers of every core in the process. Another core's traffic shares the
+// link, so capacity measured meanwhile is not this core's alone.
+static atomic_int process_transfers;
+
+static bool foreign_traffic(struct curl_ctx *ctx)
+{
+    return ctx->background_network ||
+           atomic_load_explicit(&process_transfers, memory_order_relaxed) >
+               atomic_load_explicit(&ctx->active_requests, memory_order_relaxed);
+}
+
 static CURLMcode add_curl_handle(struct curl_ctx *ctx, CURL *handle)
 {
     // Attached here, on the curl thread, while the handle is idle: streams
@@ -639,6 +657,7 @@ static CURLMcode add_curl_handle(struct curl_ctx *ctx, CURL *handle)
     if (result != CURLM_OK)
         return result;
 
+    atomic_fetch_add_explicit(&process_transfers, 1, memory_order_relaxed);
     int active = atomic_fetch_add_explicit(&ctx->active_requests, 1,
                                             memory_order_relaxed) + 1;
     atomic_fetch_add_explicit(&ctx->started_requests, 1, memory_order_relaxed);
@@ -659,6 +678,7 @@ static CURLMcode remove_curl_handle(struct curl_ctx *ctx, CURL *handle)
         int previous = atomic_fetch_sub_explicit(&ctx->active_requests, 1,
                                                   memory_order_relaxed);
         mp_assert(previous > 0);
+        atomic_fetch_sub_explicit(&process_transfers, 1, memory_order_relaxed);
     }
     return result;
 }
@@ -1309,6 +1329,11 @@ static void read_metrics(void *arg)
         .peak_reorder_bytes = atomic_load_explicit(&ctx->peak_reorder_bytes,
                                                    memory_order_relaxed),
         .physical_connections = count_connections(ctx),
+        .playback_epoch = ctx->epoch,
+        .stale_controls = ctx->stale_controls,
+        .rejected_controls = ctx->rejected_controls,
+        .background_network = ctx->background_network,
+        .declared_bitrate = ctx->declared_bitrate,
         .playback_state_updates = ctx->state_updates,
         .playback_buffer_seconds = ctx->buffer_seconds,
         .playback_demand_bitrate = MPMAX(0, ctx->media_bitrate),
@@ -1353,10 +1378,8 @@ bool mp_curl_get_metrics(struct mpv_global *global,
 
 struct curl_control {
     struct curl_ctx *ctx;
-    double media_bitrate;
-    double buffer_seconds;
-    bool paused;
-    int64_t buffer_generation;
+    struct mp_curl_control control;
+    bool ok;
 };
 
 static void set_playback_paused(struct curl_ctx *ctx, bool paused)
@@ -1373,19 +1396,64 @@ static void set_playback_paused(struct curl_ctx *ctx, bool paused)
     ctx->playback_paused = paused;
 }
 
+static bool same_configure(const struct mp_curl_control *a,
+                           const struct mp_curl_control *b)
+{
+    return a->source_bitrate == b->source_bitrate &&
+           a->delivery_bitrate == b->delivery_bitrate &&
+           a->source_size == b->source_size &&
+           a->delivery_size == b->delivery_size &&
+           a->source_duration == b->source_duration &&
+           a->delivery_duration == b->delivery_duration &&
+           a->direct_file == b->direct_file;
+}
+
+// Average demand implied by the facts, best first: what is delivered, then
+// the original only when the original is what is delivered.
+static double declared_demand(const struct mp_curl_control *c)
+{
+    if (c->delivery_bitrate > 0)
+        return c->delivery_bitrate;
+    if (c->delivery_size > 0 && c->delivery_duration > 0)
+        return c->delivery_size * 8.0 / c->delivery_duration;
+    if (c->direct_file && c->source_bitrate > 0)
+        return c->source_bitrate;
+    if (c->direct_file && c->source_size > 0 && c->source_duration > 0)
+        return c->source_size * 8.0 / c->source_duration;
+    return 0;
+}
+
+static void set_background_network(struct curl_ctx *ctx, bool active)
+{
+    if (ctx->background_network != active)
+        ctx->pause_serial++; // evidence straddling the change is invalid
+    ctx->background_network = active;
+}
+
 static void set_control(void *arg)
 {
-    struct curl_control *control = arg;
-    struct curl_ctx *ctx = control->ctx;
-    ctx->declared_bitrate = control->media_bitrate;
-    if (ctx->player_state) {
-        ctx->media_bitrate = MPMAX(ctx->observed_bitrate, ctx->declared_bitrate);
-        return;
+    struct curl_control *call = arg;
+    struct curl_ctx *ctx = call->ctx;
+    const struct mp_curl_control *c = &call->control;
+    call->ok = true;
+    if (c->op == 0) {
+        if (c->epoch < ctx->epoch) {
+            ctx->stale_controls++;
+        } else if (c->epoch == ctx->epoch) {
+            call->ok = same_configure(c, &ctx->configured);
+            ctx->rejected_controls += !call->ok;
+        } else {
+            ctx->epoch = c->epoch;
+            ctx->configured = *c;
+            ctx->declared_bitrate = declared_demand(c);
+            ctx->media_bitrate = MPMAX(ctx->observed_bitrate, ctx->declared_bitrate);
+            set_background_network(ctx, false);
+        }
+    } else if (c->epoch != ctx->epoch) {
+        ctx->stale_controls++;
+    } else {
+        set_background_network(ctx, c->background_network);
     }
-    ctx->buffer_generation = control->buffer_generation;
-    set_playback_paused(ctx, control->paused);
-    ctx->media_bitrate = control->media_bitrate;
-    ctx->buffer_seconds = control->buffer_seconds;
 }
 
 // Take the player's latest state. Demand is the larger of observed
@@ -1400,7 +1468,6 @@ static void apply_playback_state(struct curl_ctx *ctx)
     mp_mutex_unlock(&ctx->state_lock);
     if (!fresh)
         return;
-    ctx->player_state = true;
     ctx->state_updates++;
     ctx->buffer_generation = ctx->state_updates;
     if (state.seeking != ctx->playback_seeking)
@@ -1433,16 +1500,14 @@ bool mp_curl_has_streams(struct mpv_global *global)
                                 memory_order_relaxed) > 0;
 }
 
-void mp_curl_set_control(struct mpv_global *global, double media_bitrate,
-                         double buffer_seconds, bool paused,
-                         int64_t buffer_generation)
+bool mp_curl_set_control(struct mpv_global *global,
+                         const struct mp_curl_control *control)
 {
     if (!global || !global->curl)
-        return;
-    struct curl_control control = {
-        global->curl, media_bitrate, buffer_seconds, paused, buffer_generation,
-    };
-    mp_dispatch_run(global->curl->dispatch, set_control, &control);
+        return false;
+    struct curl_control call = { .ctx = global->curl, .control = *control };
+    mp_dispatch_run(global->curl->dispatch, set_control, &call);
+    return call.ok;
 }
 
 // Curl callbacks

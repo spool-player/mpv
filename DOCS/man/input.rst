@@ -2734,22 +2734,27 @@ Property list
         are measurements, not a curve extrapolated from individual lane rates.
 
 ``curl-transport-control`` (write-only)
-    Embedding-player feedback map for an already-open curl stream. Required
-    fields are ``media-bitrate`` (nonnegative number, delivered bits/s),
-    ``buffer-seconds`` (nonnegative number, playback buffer in wall-time seconds)
-    and ``paused`` (boolean). Bitrate 0 means unknown. Divide a media-timeline
-    buffer duration by playback speed when supplying speed-adjusted bitrate.
-    This describes playback state; it does not itself pause playback.
+    Host control map for the curl transport. Every map has ``format`` (the
+    integer 2), ``op`` and a positive integer ``playback-epoch``; any other key
+    must be valid for the op, or the whole map is rejected and nothing changes.
+    Playback pause, buffer and consumption come from the player itself.
 
-    Optional ``buffer-generation`` is a nonnegative integer that increases on
-    actual cache observations, not periodic resending of an old value. Clear
-    the buffer observation on load/seek. Buffer-based startup completion requires
-    an observation newer than the open/seek snapshot. Without this field, the
-    startup byte budget remains the completion fallback.
+    ``op`` 0 configures one playback's media facts, before or after load. It
+    installs only a strictly newer epoch; repeating the installed configure is
+    accepted, a different one under the same epoch is an error, and older
+    epochs are ignored (counted as ``stale-controls``). Optional facts:
+    ``source-bitrate`` and ``delivery-bitrate`` (bits/s, at most 1e12),
+    ``source-size-bytes`` and ``delivery-size-bytes`` (integers),
+    ``source-duration-seconds`` and ``delivery-duration-seconds``, and
+    ``direct-file`` (the delivered bytes are the original file). Absent or 0
+    is unknown. The demand prior is the delivered bitrate, else delivered size
+    over duration, else the original's bitrate or size over duration only for
+    a direct file.
 
-    Updating feedback about once a second is sufficient for steady state;
-    promptly refresh cache/pause/seek observations at lifecycle changes. Learned
-    seed options apply to new streams, while this control updates existing ones.
+    ``op`` 1 updates the current epoch: ``background-network`` (boolean) says
+    the host is fetching other data over the network. While it is set,
+    capacity evidence is not accepted, as when another core in the process
+    is transferring. Updates for any other epoch are ignored.
 
 
 ``demuxer-cache-duration``

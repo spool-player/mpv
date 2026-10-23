@@ -7,6 +7,7 @@ The fixture is the real HTTP boundary. It does not mock scheduling or metrics.
 """
 
 import argparse
+import array
 import contextlib
 import ctypes as C
 import hashlib
@@ -198,7 +199,12 @@ class Origin:
                  shared=0, serialized=False, reorder=False, fault=None,
                  cap=0, unknown_size=False, contention=False, etag=None,
                  changed=False, pause=None, fault_after=1, tls=None):
-        pcm = (bytes(range(256)) * ((size + 255) // 256))[:size - size % 4]
+        # A frame counter, never periodic: a duplicated, dropped or reordered
+        # range of any alignment changes the PCM, not only its length.
+        frames = array.array("I", range(size // 4))
+        if sys.byteorder != "little":
+            frames.byteswap()
+        pcm = frames.tobytes()
         self.pcm = pcm
         self.payload = (b"RIFF" + struct.pack("<I", len(pcm) + 36) + b"WAVEfmt " +
                         struct.pack("<IHHIIHH", 16, 1, 2, 48000, 192000, 4, 16) +

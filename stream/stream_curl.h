@@ -124,6 +124,10 @@ struct mp_curl_metrics {
     double curl_thread_cpu_seconds;
     double curl_thread_wall_seconds;
     bool curl_thread_cpu_available;
+    // Sampled on consumer read/wait boundaries, deduplicated by thread.
+    // This includes other work on those threads, not only stream copies.
+    double consumer_cpu_seconds;
+    bool consumer_cpu_available;
     // Summed wall time across streams (not CPU time), including ongoing
     // producer-full and consumer-empty intervals in every snapshot.
     double ring_wait_seconds;
@@ -138,6 +142,9 @@ struct mp_curl_metrics {
     // snapshot, and for the worker's lifetime.
     double recent_lateness_ms;
     double peak_lateness_ms;
+    // Last completed one-second deadline window; conservative histogram bounds.
+    double lateness_p50_ms, lateness_p99_ms;
+    bool lateness_available;
     // Sockets as the kernel reports them (-1 unavailable). RTT is the kernel's
     // smoothed TCP RTT, never request time-to-first-byte.
     int64_t open_sockets;

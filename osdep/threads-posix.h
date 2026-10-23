@@ -20,6 +20,10 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/thread_info.h>
+#endif
 
 #include "common/common.h"
 #include "config.h"
@@ -237,6 +241,16 @@ static inline int64_t mp_thread_cpu_time_ns(mp_thread_id thread)
     struct timespec ts;
     if (pthread_getcpuclockid(thread, &id) == 0 && clock_gettime(id, &ts) == 0)
         return MP_TIME_S_TO_NS(ts.tv_sec) + ts.tv_nsec;
+#endif
+#ifdef __APPLE__
+    thread_basic_info_data_t info;
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    mach_port_t port = pthread_mach_thread_np(thread);
+    if (port != MACH_PORT_NULL && thread_info(port, THREAD_BASIC_INFO, (thread_info_t)&info, &count) == KERN_SUCCESS
+        && count >= THREAD_BASIC_INFO_COUNT) {
+        return MP_TIME_S_TO_NS((int64_t)info.user_time.seconds + info.system_time.seconds)
+            + ((int64_t)info.user_time.microseconds + info.system_time.microseconds) * 1000;
+    }
 #endif
     return -1;
 }

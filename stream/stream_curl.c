@@ -386,6 +386,7 @@ struct dynamic_request {
     CURL *curl;
     struct range_desc *range; // range being fetched, NULL when idle
     size_t fetch_pos;         // next offset in range this transfer writes
+    size_t length; // range size; the descriptor may be recycled
     bool active;
     bool response_ok;
     bool changed;             // retried bytes differ from published bytes
@@ -1488,12 +1489,8 @@ static MP_THREAD_VOID curl_thread(void *arg)
                                                   memory_order_relaxed);
             } else {
                 struct dynamic_request *request = (struct dynamic_request *)ref;
-                succeeded = succeeded && request->response_ok &&
-                            request->range &&
-                            request->fetch_pos ==
-                                request->range->end - request->range->start &&
-                            !atomic_load_explicit(&request->ref.p->aborted,
-                                                  memory_order_relaxed);
+                succeeded = succeeded && request->response_ok && request->range && request->fetch_pos == request->length
+                    && !atomic_load_explicit(&request->ref.p->aborted, memory_order_relaxed);
             }
             remove_curl_handle(ctx, msg->easy_handle);
             end_measurement(ref, succeeded);
@@ -1962,9 +1959,12 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
     size_t bytes = size * nmemb;
     p->ctx->body_callbacks++;
 
-    // Reject error bodies and servers that returned the wrong byte range.
-    if (!p->response_ok)
+    // Reject error bodies and servers that returned the wrong byte range,
+    // including a chunked range reply longer than the range.
+    if (!p->response_ok
+        || (p->reply_ranged && p->primary_end && bytes > p->primary_end - p->request_start - p->request_received)) {
         return CURL_WRITEFUNC_ERROR;
+    }
 
     if (atomic_load_explicit(&p->aborted, memory_order_relaxed))
         return CURL_WRITEFUNC_ERROR;
@@ -2124,10 +2124,8 @@ static size_t dynamic_write_callback(char *ptr, size_t size, size_t nmemb,
     size_t bytes = size * nmemb;
     p->ctx->body_callbacks++;
 
-    if (!range || !request->response_ok ||
-        atomic_load_explicit(&p->aborted, memory_order_relaxed) ||
-        bytes > range->end - range->start - request->fetch_pos)
-    {
+    if (!range || !request->response_ok || atomic_load_explicit(&p->aborted, memory_order_relaxed)
+        || bytes > request->length - request->fetch_pos) {
         return CURL_WRITEFUNC_ERROR;
     }
     int64_t now = record_received_bytes(&request->ref, bytes);
@@ -2731,6 +2729,7 @@ static bool start_range_transfer(struct dynamic_request *request,
     size_t from = p->etag ? range->received : 0;
     request->range = range;
     request->fetch_pos = from;
+    request->length = range->end - range->start;
     request->response_ok = false;
     request->changed = false;
     range->request = request;
@@ -3106,10 +3105,23 @@ static void on_dynamic_done(struct dynamic_request *request, CURLcode code)
     request->range = NULL;
     if (!range)
         return;
-    size_t expected = range->end - range->start;
-    if (code == CURLE_OK && request->response_ok &&
-        request->fetch_pos == expected && !aborted)
-    {
+    // A strong-validator range is published, readable and recyclable once
+    // its last byte arrives. How its connection then ends cannot change
+    // those bytes, and must neither retry nor touch a recycled descriptor.
+    if (range->request != request || range->complete) {
+        if (range->request == request)
+            range->request = NULL;
+        if (!aborted) {
+            fill_dynamic(p);
+            check_dynamic_eof(p);
+        }
+        return;
+    }
+    // Every byte of the validated range arrived in one response, whatever
+    // the result code: a lost terminator, a reset, or our refusal of bytes
+    // past the range is not a reason to fetch it again.
+    bool whole = request->response_ok && request->fetch_pos == request->length;
+    if (whole && !aborted) {
         publish_range(p, range, mp_time_ns(), true);
         range->request = NULL;
         fill_dynamic(p);
@@ -3191,6 +3203,10 @@ static void on_done(struct priv *p, CURLcode code)
     uint64_t received = p->request_received;
     p->request_start += received;
     p->request_received = 0;
+    // A reply that delivered its whole range is complete, even if its
+    // connection then failed or it overran the range: retrying from its end
+    // would fetch bytes the parallel queue also delivers.
+    bool whole = p->response_ok && p->primary_end && p->request_start == p->primary_end;
 
     if (p->reply_eof && !aborted) {
         // The reply marked the end of the file and its body was dropped, so
@@ -3203,7 +3219,7 @@ static void on_done(struct priv *p, CURLcode code)
         return;
     }
 
-    if (code == CURLE_OK && p->response_ok && !aborted) {
+    if ((code == CURLE_OK || whole) && p->response_ok && !aborted) {
         p->retry_count = 0;
         if (p->dynamic_supported) {
             p->primary_done = true;

@@ -198,7 +198,7 @@ class Origin:
     def __init__(self, size=8 << 20, latency=0.04, per_lane=2 << 20,
                  shared=0, serialized=False, reorder=False, fault=None,
                  cap=0, unknown_size=False, contention=False, etag=None,
-                 changed=False, pause=None, fault_after=1, tls=None):
+                 changed=False, pause=None, fault_after=1, fault_start=None, tls=None):
         # A frame counter, never periodic: a duplicated, dropped or reordered
         # range of any alignment changes the PCM, not only its length.
         frames = array.array("I", range(size // 4))
@@ -217,6 +217,7 @@ class Origin:
         # the injected fault; pause: (offset, seconds) to go quiet mid-body.
         self.etag, self.changed, self.pause = etag, changed, pause
         self.fault_after = fault_after  # first request start eligible for the fault
+        self.fault_start = fault_start  # or only a request starting exactly here
         self.replaced = False
         self.resumed = []  # per TLS request: did the handshake resume a session
         self.fault_range = None
@@ -253,7 +254,8 @@ class Origin:
                 with origin.lock:
                     if origin.tls:
                         origin.resumed.append(self.connection.session_reused)
-                    inject = bool(origin.fault and not origin.faulted and start >= origin.fault_after)
+                    inject = bool(origin.fault and not origin.faulted and start >= origin.fault_after
+                                  and origin.fault_start in (None, start))
                     origin.faulted |= inject
                     if inject:
                         origin.fault_range = (start, end)
@@ -271,10 +273,18 @@ class Origin:
                             self.send_header("Content-Length", "0")
                             self.end_headers()
                             return
+                        # The whole range is sent chunked, then the connection
+                        # drops before the terminating chunk; or a chunked reply
+                        # carries on past the end of its Content-Range.
+                        unterminated = inject and origin.fault == "unterminated"
+                        overlong = inject and origin.fault == "overlong"
                         self.send_response(206 if match else 200)
                         self.send_header("Accept-Ranges", "bytes")
                         self.send_header("Content-Type", "audio/wav")
-                        self.send_header("Content-Length", str(end - start))
+                        if unterminated or overlong:
+                            self.send_header("Transfer-Encoding", "chunked")
+                        else:
+                            self.send_header("Content-Length", str(end - start))
                         if etag:
                             self.send_header("ETag", etag)
                         if match:
@@ -284,6 +294,8 @@ class Origin:
                         self.end_headers()
                         cut = inject and origin.fault in ("truncate", "stall")
                         stop = start + (end - start) // 2 if cut else end
+                        if overlong:
+                            stop = min(end + 4096, len(payload))
                         deadline = time.monotonic()
                         for offset in range(start, stop, 16384):
                             if origin.pause and origin.pause_window is None and \
@@ -305,13 +317,20 @@ class Origin:
                                     penalty = origin.active ** 2 if origin.contention else 1
                                 deadline += len(block) * penalty / origin.per_lane
                                 time.sleep(max(0, deadline - time.monotonic()))
-                            self.wfile.write(block)
+                            chunked = unterminated or overlong
+                            self.wfile.write(b"%x\r\n%s\r\n" % (len(block), block) if chunked else block)
                             self.wfile.flush()
-                        if stop != end and origin.fault == "stall":
+                        if overlong:
+                            self.wfile.write(b"0\r\n\r\n")
+                        if unterminated:
+                            # Long enough for playback to read the range.
+                            time.sleep(0.5)
+                            self.close_connection = True
+                        if stop < end and origin.fault == "stall":
                             # Go quiet with the connection open, as a server
                             # that lost interest without closing does.
                             time.sleep(STALL_SECONDS)
-                        if stop != end:
+                        if stop < end:
                             self.close_connection = True
                             if origin.changed:
                                 with origin.lock:
@@ -594,6 +613,70 @@ class CurlTransport(unittest.TestCase):
                 else:
                     self.assertNotIn(middle, starts)
                     self.assertEqual(starts.count(start), 2)
+
+    def test_connection_lost_after_a_whole_range_is_not_retried(self):
+        # Every byte of the range arrived and was validated, then the
+        # connection dropped. The range is complete: refetching from its end
+        # would duplicate bytes the parallel queue also delivers (primary) or
+        # request an empty range for a descriptor playback may already have
+        # read and reused (parallel range). Both faults follow lavf's seek
+        # back to the WAV data at byte 44, so playback reads what follows.
+        for name, fault in (("primary", {"fault_start": 44}), ("parallel range", {"fault_after": 3 << 20})):
+            # Long enough that playback is still reading when the faulted
+            # connection finally drops.
+            with self.subTest(request=name), Origin(size=12 << 20, fault="unterminated", etag='"v1"',
+                                                    **fault) as origin, \
+                    tempfile.TemporaryDirectory() as directory:
+                output = pathlib.Path(directory) / "actual.pcm"
+                player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
+                                           "ao-pcm-waveheader": "no", "audio-format": "s16",
+                                           "curl-adaptive": "no"})
+                try:
+                    metrics = player.play(origin.url)["metrics"]
+                finally:
+                    player.close()
+                self.assertIsNotNone(origin.fault_range)
+                self.assertEqual(output.read_bytes(), origin.pcm)
+                self.assertEqual(metrics["retry-attempts"], 0)
+
+    def test_fallback_restarts_at_the_first_unread_byte(self):
+        # A parallel range fails with no retries left, so the queue is dropped
+        # for one request. With a strong validator its prefix may already be
+        # read; without one it is still hidden. Either way playback continues
+        # from exactly the first byte it has not read.
+        for etag in ('"v1"', None):
+            with self.subTest(etag=etag), Origin(size=12 << 20, fault="truncate", etag=etag,
+                                                 fault_after=3 << 20) as origin, \
+                    tempfile.TemporaryDirectory() as directory:
+                output = pathlib.Path(directory) / "actual.pcm"
+                player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
+                                           "ao-pcm-waveheader": "no", "audio-format": "s16",
+                                           "curl-adaptive": "no", "curl-max-retries": "0"})
+                try:
+                    metrics = player.play(origin.url)["metrics"]
+                finally:
+                    player.close()
+                self.assertIsNotNone(origin.fault_range)
+                self.assertEqual(metrics["selected-requests"], 1)
+                self.assertEqual(output.read_bytes(), origin.pcm)
+
+    def test_range_reply_longer_than_its_range_is_rejected(self):
+        # A chunked 206 has no Content-Length to stop it. Bytes past the end
+        # of the range belong to later offsets and must never be played here.
+        for name, fault in (("primary", {"fault_start": 44}), ("parallel range", {"fault_after": 3 << 20})):
+            with self.subTest(request=name), Origin(size=6 << 20, fault="overlong", etag='"v1"',
+                                                    **fault) as origin, \
+                    tempfile.TemporaryDirectory() as directory:
+                output = pathlib.Path(directory) / "actual.pcm"
+                player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
+                                           "ao-pcm-waveheader": "no", "audio-format": "s16",
+                                           "curl-adaptive": "no"})
+                try:
+                    player.play(origin.url)
+                finally:
+                    player.close()
+                self.assertIsNotNone(origin.fault_range)
+                self.assertEqual(output.read_bytes(), origin.pcm)
 
     def test_replaced_file_is_never_spliced_into_playback(self):
         # The file changes while a published range is being retried. Whether

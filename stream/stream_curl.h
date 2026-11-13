@@ -30,6 +30,15 @@ struct demuxer;
 // Initialize libcurl state, must be called before stream_curl is used.
 void mp_curl_global_init(struct mpv_global *global);
 
+struct mp_curl_capabilities {
+    bool http2, http3, alt_svc, quic_batching;
+    int hw_aes;
+    unsigned version;
+    const char *tls_backend;
+};
+void mp_curl_get_capabilities(struct mp_curl_capabilities *capabilities);
+bool mp_curl_valid_origin(const char *origin);
+
 // Playback facts the player supplies to the transport, at most every 250 ms.
 // Rates are bits/s of media consumption (already scaled by speed); negative
 // values are unknown.
@@ -71,13 +80,24 @@ struct mp_curl_stream_metrics {
     int64_t id;
     int64_t readable_bytes, retained_bytes, reorder_bytes;
     bool prefix_publication_available;
+    int effective_http_version, http_fallbacks;
+    int controller_state, last_reason;
+    double urgency;
+    int64_t udp_requested, udp_effective;
 };
 
+struct mp_curl_origin_metrics {
+    int64_t id, cooldown_ms;
+    int h2_state, h3_state;
+};
 struct mp_curl_connection_metrics {
     int64_t id, socket_generation; // opaque, never a descriptor/address
     int http_version; // 0 unknown, 10, 11, 20, 30
     int transport; // 0 unknown, 1 TCP, 2 UDP
     int64_t active_requests;
+    int64_t udp_drops; // -1 unavailable
+    int64_t receive_requested;
+    int receive_status; // 0 untouched, 1 applied, 2 clamped, 3 denied
     int64_t receive_buffer, receive_window; // -1 unavailable
     double rtt_ms; // -1 unavailable
 };
@@ -89,7 +109,19 @@ struct mp_curl_protocol_metrics {
     bool cpu_available;
 };
 
+#define MP_CURL_MAX_SAMPLES 64
+struct mp_curl_sample {
+    int requests, http_version, receive_profile, source;
+    int64_t receive_bytes, range_bytes, ordered_bps, updated_ms, samples;
+    double ttfb_ms;
+};
+
 struct mp_curl_metrics {
+    int64_t baseline_raw_bytes, allocated_raw_bytes, reserved_socket_bytes;
+    int64_t desired_extra_bytes, committed_extra_bytes;
+    bool primary_origin_match;
+    int num_samples;
+    struct mp_curl_sample samples[MP_CURL_MAX_SAMPLES];
     int64_t active_requests;
     int64_t peak_active_requests;
     int64_t active_streams;
@@ -112,7 +144,8 @@ struct mp_curl_metrics {
     // Callback wall time is nested in perform (or dispatch on unpause).
     bool callback_time_included;
     bool snapshot_truncated;
-    int num_streams, num_connections;
+    int num_streams, num_connections, num_origins;
+    struct mp_curl_origin_metrics origins[64];
     struct mp_curl_stream_metrics streams[MP_CURL_MAX_METRIC_STREAMS];
     struct mp_curl_connection_metrics connections[MP_CURL_MAX_METRIC_CONNECTIONS];
     struct mp_curl_protocol_metrics protocols[3]; // HTTP/1.1, HTTP/2, HTTP/3
@@ -180,6 +213,12 @@ bool mp_curl_get_metrics(struct mpv_global *global,
 // installs one playback's media facts under a strictly newer epoch; an update
 // changes live host state for the current epoch only. Facts <= 0 are unknown.
 struct mp_curl_control {
+    int max_requests, fixed_requests, receive_mode, http_mode;
+    bool explore;
+    int64_t receive_bytes, joint_extra_grant;
+    char primary_origin[512];
+    int num_samples;
+    struct mp_curl_sample samples[MP_CURL_MAX_SAMPLES];
     int op; // 0 configure, 1 update
     int64_t epoch; // > 0
     // op 0. Bitrates are bits/s, sizes bytes, durations seconds.

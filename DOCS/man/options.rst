@@ -6058,78 +6058,58 @@ TLS/connection diagnostics), set ``--msg-level=curl=trace``.
     non-seekable streams.
 
 ``--curl-parallel-requests=<1-16>``
-    Maximum concurrent logical request lanes per stream (default: 1, no
-    concurrency). Lanes are curl multi requests, not operating-system threads
-    or necessarily separate connections: HTTP/2 and HTTP/3 may multiplex them.
-    Consecutive ranges are delivered to the demuxer in byte order.
+    Hard maximum concurrent requests per stream (default: 4). Requests share one
+    worker; HTTP/2 and HTTP/3 can multiplex them over one physical connection.
+    All streams share the core's raw-memory allowance. Up to 32 independent
+    range descriptors retain only admitted bytes, including across seeks.
 
-    Ranged scheduling requires HTTP, a known content length, byte-range support,
-    and a non-zero ``--curl-max-request-size``. Failed ranges are retried before
-    falling back to one primary request. Wrong or ignored ranges are never
-    appended to the media stream.
+``--curl-fixed-requests=<0-16>``
+    Fix the request-count target, capped by the maximum above (default: 0,
+    automatic). Memory, EOF and protocol safety can reduce the effective count.
+    Count restrictions do not disable safety, range or protocol measurements.
 
-    Speculative segment storage is bounded by one additional
-    ``--curl-buffer-size`` allocation, not request count times the configured
-    maximum range size. Each segment is capped by both
-    ``--curl-max-request-size`` and ring size divided by the maximum lane count.
-    This excludes libcurl's own protocol/TLS buffers.
+``--curl-explore=<yes|no>``
+    Permit comfortable-cache comparisons (default: yes). Recovery remains
+    enabled. Count comparisons use adjacent equal-byte baseline/candidate/
+    baseline intervals; changed paths, retries, pauses and short EOF batches
+    invalidate the comparison. The smallest count within 90% of a demonstrated
+    matching profile wins near ties. Learning survives seek.
 
-``--curl-adaptive=<yes|no>``
-    Adjust ranged concurrency at request boundaries (default: yes), within
-    ``--curl-parallel-requests``. With ``no``, use the configured maximum.
-    With ``yes``, aim for the smallest measured budget providing approximately
-    1.75 times the supplied delivered-media bitrate. Increase one lane at a time;
-    revert trials with negligible improvement, negative scaling, or poor ordered
-    progress. Try smaller budgets when playback has buffer reserve. In-flight
-    ranges drain in order instead of being cancelled on a budget change.
+``--curl-receive-mode=<os-auto|measured|fixed>``
+    Receive-window policy (default: measured). OS-auto leaves TCP autotuning
+    untouched. Measured starts with the same baseline and admits bounded fresh
+    socket comparisons when path, kernel ceilings and memory justify them.
+    Fixed requests the size below before connecting each new TCP socket. Socket
+    reservations share the host's extra-memory grant; insufficient admission
+    preserves baseline playback and reports the effective fallback.
 
-    Capacity learning includes connection setup, time to first byte and server
-    stalls. It accumulates active network time across cached/full-ring idle
-    periods, without interpreting intentional backpressure or user pause as
-    deficient server capacity. Startup, failed requests and mixed configuration
-    generations are not steady-state capacity samples. These are bounded
-    heuristics, not a guarantee of maximum speed or uninterrupted playback.
+``--curl-receive-bytes=<bytes>``
+    Fixed receive-window request, 1..16 MiB (default: 4 MiB). The kernel may clamp
+    it; requested and effective values and the outcome are reported separately.
+    The transport never changes kernel settings or requests extra privileges.
+    UDP receive buffers are sized independently; TCP overrides never apply to
+    a QUIC socket.
 
-``--curl-initial-requests=<1-16>``
-    Learned steady-state lane seed (default: 1), capped by the maximum. Used
-    after the startup-demand phase; ignored with ``--curl-adaptive=no``.
+``--curl-http-mode=<auto|tcp|http1|prefer-h3>``
+    Automatic starts with negotiated HTTPS HTTP/2 or HTTP/1.1. HTTP/3 requires
+    measured path benefit, CPU/crypto, verified batching and admitted UDP buffer
+    capacity. TCP disables HTTP/3, HTTP1 forces HTTP/1.1, and prefer-H3 requests
+    HTTP/3 with curl's TCP connection race. Plain HTTP always uses HTTP/1.1.
+    An explicit ``--curl-http-version`` retains precedence.
 
-``--curl-startup-requests=<1-16>``
-    Startup lane seed (default: 1), capped by the maximum. An embedding player
-    can choose a startup budget separately from steady-state demand using
-    measured capacities and time-to-first-byte estimates.
+    Protocol failures downgrade an unfinished validated suffix over a fresh
+    connection, including one retry beyond the ordinary retry budget. HTTP/3
+    falls back to TCP, then failed HTTP/2 falls back to HTTP/1.1. A process-wide
+    bounded origin table avoids the failed protocol for ten minutes, without
+    persisting or exposing origin addresses. TLS verification remains enabled.
 
-``--curl-startup-bytes=<bytes>``
-    Explicit ordered startup byte budget (default: 0, infer from media bitrate
-    and remaining startup buffer target). Unknown bitrate uses a conservative
-    128 KiB demand fallback. The byte budget includes the leading request, and
-    may span multiple bounded-memory cohorts. Reaching this byte budget is not
-    proof that a container has been demuxed or that a video frame is playable.
-
-``--curl-startup-buffer-seconds=<seconds>``
-    Startup wall-time buffer target (default: 0.5). Startup ends when its ordered
-    byte budget is delivered or fresh playback feedback reaches this target.
-    Zero disables buffer-based completion. Without embedding-player feedback,
-    only the byte budget is used.
-
-``--curl-ttfb-ms=<milliseconds>``
-    Learned request-to-first-body-byte estimate (default: 0, unknown). This
-    includes DNS, connection/TLS setup and server/disk queueing; it is not a
-    pure network RTT. Used to amortize request overhead within the range and
-    memory ceilings. A high-latency seed or explicit useful demand avoids an
-    unconditional tiny leading request.
-
-``--curl-observed-bps=<bytes-per-second>``
-    Learned aggregate capacity seed (default: 0, unknown), used for bounded
-    range sizing. This is bytes/s, not bits/s, and is not added to traffic
-    counters or reported as a measured peak.
-
-``--curl-media-bitrate=<bits-per-second>``
-    Expected delivered-media bitrate (default: 0, unknown), including playback
-    speed when relevant. Do not supply an original-media bitrate when a
-    transcode has a different output rate. Zero disables bitrate-driven lane
-    trials. Embedding players can update this and buffer/pause state using
-    ``curl-transport-control``.
+The read-only ``curl-transport-capabilities`` property reports build features.
+``curl-transport-metrics`` reports bounded numeric stream, connection, profile,
+origin-cooldown and desired/committed memory state. Socket reservations are
+conservative charges and raw-memory limits do not claim to cap process RSS or
+curl/TLS/QUIC internals. Embedders configure restrictions, media facts, matching
+priors and current-epoch memory grants with ``curl-transport-control`` format 2.
+Configure epochs must increase; stale or duplicate controls fail atomically.
 
 DVB
 ---

@@ -685,14 +685,14 @@ if darwin
     subdir(join_paths('TOOLS', 'osxbundle'))
 endif
 
-libcurl = dependency('libcurl', version: '>= 8.2.0',
-                     static: get_option('starfish').enabled(),
+libcurl = dependency('libcurl', version: '>= 8.21.0',
+                     static: get_option('default_library') == 'static' or host_machine.system() in ['windows', 'android'],
                      required: get_option('libcurl'))
 features += {'libcurl': libcurl.found()}
 if features['libcurl']
     dependencies += [libcurl]
     sources += files('demux/avio_crypto.c',
-                     'stream/stream_curl.c')
+                     'stream/stream_curl.c', 'stream/curl_controller.c', 'stream/curl_budget.c', 'stream/curl_policy.c')
 endif
 
 cdda_opt = get_option('cdda').require(
@@ -1879,6 +1879,8 @@ endif
 
 # Set config.h
 conf_data = configuration_data()
+quic_batching = features['libcurl'] and libcurl.get_variable(pkgconfig: 'spool_quic_batching', default_value: '0') == '1'
+conf_data.set10('MP_CURL_QUIC_BATCHING', quic_batching)
 conf_data.set_quoted('CONFIGURATION', meson.build_options().strip().replace('\\', '/'))
 conf_data.set_quoted('DEFAULT_OPTICAL_DEVICE', optical_device)
 

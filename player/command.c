@@ -1714,6 +1714,29 @@ static int mp_property_demuxer_cache_state(void *ctx, struct m_property *prop,
 }
 
 #if HAVE_LIBCURL
+static int mp_property_curl_transport_capabilities(void *ctx, struct m_property *prop,
+                                                  int action, void *arg)
+{
+    if (action == M_PROPERTY_GET_TYPE) {
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
+        return M_PROPERTY_OK;
+    }
+    if (action != M_PROPERTY_GET)
+        return M_PROPERTY_NOT_IMPLEMENTED;
+    struct mp_curl_capabilities c;
+    mp_curl_get_capabilities(&c);
+    struct mpv_node *result = arg;
+    node_init(result, MPV_FORMAT_NODE_MAP, NULL);
+    node_map_add_flag(result, "http2", c.http2);
+    node_map_add_flag(result, "http3", c.http3);
+    node_map_add_flag(result, "alt-svc", c.alt_svc);
+    node_map_add_flag(result, "quic-batching", c.quic_batching);
+    node_map_add_int64(result, "hw-aes", c.hw_aes);
+    node_map_add_int64(result, "curl-version", c.version);
+    node_map_add_string(result, "tls-backend", c.tls_backend);
+    return M_PROPERTY_OK;
+}
+
 static int mp_property_curl_transport_metrics(void *ctx,
                                               struct m_property *prop,
                                               int action, void *arg)
@@ -1732,6 +1755,11 @@ static int mp_property_curl_transport_metrics(void *ctx,
 
     struct mpv_node *result = arg;
     node_init(result, MPV_FORMAT_NODE_MAP, NULL);
+    node_map_add_int64(result, "baseline-raw-bytes", metrics.baseline_raw_bytes);
+    node_map_add_int64(result, "allocated-raw-bytes", metrics.allocated_raw_bytes);
+    node_map_add_int64(result, "reserved-manual-socket-bytes", metrics.reserved_socket_bytes);
+    node_map_add_int64(result, "desired-joint-extra-grant-bytes", metrics.desired_extra_bytes);
+    node_map_add_int64(result, "committed-joint-extra-grant-bytes", metrics.committed_extra_bytes);
     node_map_add_int64(result, "active-requests", metrics.active_requests);
     node_map_add_int64(result, "peak-active-requests",
                        metrics.peak_active_requests);
@@ -1800,7 +1828,23 @@ static int mp_property_curl_transport_metrics(void *ctx,
         node_map_add_int64(entry, "readable-bytes", stream->readable_bytes);
         node_map_add_int64(entry, "retained-bytes", stream->retained_bytes);
         node_map_add_int64(entry, "reorder-bytes", stream->reorder_bytes);
+        node_map_add_int64(entry, "effective-http-version", stream->effective_http_version);
+        node_map_add_int64(entry, "http-fallbacks", stream->http_fallbacks);
+        node_map_add_int64(entry, "state", stream->controller_state);
+        node_map_add_int64(entry, "last-reason", stream->last_reason);
+        node_map_add_double(entry, "urgency", stream->urgency);
+        node_map_add_int64(entry, "udp-rcvbuf-requested", stream->udp_requested);
+        node_map_add_int64(entry, "udp-rcvbuf-effective", stream->udp_effective);
         node_map_add_flag(entry, "prefix-publication-available", stream->prefix_publication_available);
+    }
+    struct mpv_node *origins = node_map_add(result, "origins", MPV_FORMAT_NODE_ARRAY);
+    for (int n = 0; n < metrics.num_origins; n++) {
+        const struct mp_curl_origin_metrics *origin = &metrics.origins[n];
+        struct mpv_node *entry = node_array_add(origins, MPV_FORMAT_NODE_MAP);
+        node_map_add_int64(entry, "origin-id", origin->id);
+        node_map_add_int64(entry, "h2-state", origin->h2_state);
+        node_map_add_int64(entry, "h3-state", origin->h3_state);
+        node_map_add_int64(entry, "cooldown-remaining-ms", origin->cooldown_ms);
     }
     struct mpv_node *connections = node_map_add(result, "connections", MPV_FORMAT_NODE_ARRAY);
     for (int n = 0; n < metrics.num_connections; n++) {
@@ -1812,6 +1856,15 @@ static int mp_property_curl_transport_metrics(void *ctx,
         node_map_add_int64(entry, "transport", connection->transport);
         node_map_add_int64(entry, "active-requests", connection->active_requests);
         node_map_add_int64(entry, "socket-receive-buffer-bytes", connection->receive_buffer);
+        node_map_add_int64(entry, "receive-requested-bytes", connection->receive_requested);
+        node_map_add_int64(entry, "receive-effective-bytes", connection->receive_buffer);
+        node_map_add_int64(entry, "receive-status", connection->receive_status);
+        if (connection->transport == 2) {
+            node_map_add_int64(entry, "udp-rcvbuf-requested", connection->receive_requested);
+            node_map_add_int64(entry, "udp-rcvbuf-effective", connection->receive_buffer);
+            node_map_add_int64(entry, "udp-drops", connection->udp_drops);
+            node_map_add_flag(entry, "udp-drops-available", connection->udp_drops >= 0);
+        }
         node_map_add_flag(entry, "socket-receive-buffer-available", connection->receive_buffer >= 0);
         node_map_add_int64(entry, "receive-window-bytes", connection->receive_window);
         node_map_add_flag(entry, "receive-window-available", connection->receive_window >= 0);
@@ -1892,10 +1945,31 @@ static int mp_property_curl_transport_metrics(void *ctx,
                        metrics.capacity_bytes_per_second);
     node_map_add_int64(result, "capacity-samples", metrics.capacity_samples);
     node_map_add_int64(result, "stream-id", metrics.stream_id);
+    node_map_add_flag(result, "primary-origin-match", metrics.primary_origin_match);
+    struct mpv_node *samples = node_map_add(result, "transport-samples", MPV_FORMAT_NODE_ARRAY);
+    for (int n = 0; n < metrics.num_samples; n++) {
+        const struct mp_curl_sample *sample = &metrics.samples[n];
+        struct mpv_node *entry = node_array_add(samples, MPV_FORMAT_NODE_MAP);
+        node_map_add_int64(entry, "requests", sample->requests);
+        node_map_add_int64(entry, "http-version", sample->http_version);
+        node_map_add_int64(entry, "receive-profile", sample->receive_profile);
+        node_map_add_int64(entry, "receive-bytes", sample->receive_bytes);
+        node_map_add_int64(entry, "range-bytes", sample->range_bytes);
+        node_map_add_int64(entry, "ordered-bytes-per-second", sample->ordered_bps);
+        node_map_add_double(entry, "ttfb-ms", sample->ttfb_ms);
+        node_map_add_int64(entry, "updated-at-ms", sample->updated_ms);
+        node_map_add_int64(entry, "source", sample->source);
+        node_map_add_int64(entry, "samples", sample->samples);
+    }
     struct mpv_node *lanes = node_map_add(result, "lane-samples",
                                          MPV_FORMAT_NODE_ARRAY);
     struct mpv_node *points = node_map_add(result, "concurrency-samples",
                                           MPV_FORMAT_NODE_ARRAY);
+    // Adding another parent-map value can reallocate its values array.
+    // Reacquire children before populating them, rather than retaining a
+    // pointer invalidated by node_map_add().
+    lanes = node_map_get(result, "lane-samples");
+    points = node_map_get(result, "concurrency-samples");
     for (int n = 0; n < MP_CURL_MAX_LANES; n++) {
         struct mp_curl_lane_metrics *lane = &metrics.lanes[n];
         if (lane->received_bytes) {
@@ -1926,6 +2000,43 @@ static int mp_property_curl_transport_metrics(void *ctx,
     return M_PROPERTY_OK;
 }
 
+static bool curl_sample_field(struct mpv_node *node, const char *key,
+                              struct mp_curl_sample *sample)
+{
+    if (!strcmp(key, "ttfb-ms")) {
+        double value = node->format == MPV_FORMAT_DOUBLE ? node->u.double_
+            : node->format == MPV_FORMAT_INT64 ? node->u.int64 : -1;
+        if (!isfinite(value) || value < 0 || value > 600000)
+            return false;
+        sample->ttfb_ms = value;
+        return true;
+    }
+    if (node->format != MPV_FORMAT_INT64 || node->u.int64 < 0)
+        return false;
+    int64_t value = node->u.int64;
+    if (!strcmp(key, "requests") && value >= 1 && value <= 16)
+        sample->requests = value;
+    else if (!strcmp(key, "http-version") && (value == 0 || value == 11 || value == 20 || value == 30))
+        sample->http_version = value;
+    else if (!strcmp(key, "receive-profile") && value <= 1)
+        sample->receive_profile = value;
+    else if (!strcmp(key, "receive-bytes") && value <= (16 << 20))
+        sample->receive_bytes = value;
+    else if (!strcmp(key, "range-bytes") && value <= (16 << 20))
+        sample->range_bytes = value;
+    else if (!strcmp(key, "ordered-bytes-per-second") && value > 0)
+        sample->ordered_bps = value;
+    else if (!strcmp(key, "updated-at-ms"))
+        sample->updated_ms = value;
+    else if (!strcmp(key, "source") && value >= 1 && value <= 2)
+        sample->source = value;
+    else if (!strcmp(key, "samples") && value > 0)
+        sample->samples = value;
+    else
+        return false;
+    return true;
+}
+
 // Every key must be known for its op and well-typed, or nothing changes.
 static bool curl_control_field(struct mpv_node *node, const char *key,
                                struct mp_curl_control *c)
@@ -1945,9 +2056,71 @@ static bool curl_control_field(struct mpv_node *node, const char *key,
         return c->epoch > 0;
     }
     if (c->op == 1) {
+        if (!strcmp(key, "joint-extra-grant-bytes")) {
+            if (!count || node->u.int64 > (128LL << 20))
+                return false;
+            c->joint_extra_grant = node->u.int64;
+            return true;
+        }
         if (strcmp(key, "background-network") || node->format != MPV_FORMAT_FLAG)
             return false;
         c->background_network = node->u.flag;
+        return true;
+    }
+    if (!strcmp(key, "max-requests") || !strcmp(key, "fixed-requests") ||
+        !strcmp(key, "receive-mode") || !strcmp(key, "http-mode")) {
+        if (!count)
+            return false;
+        int64_t restriction = node->u.int64;
+        if (!strcmp(key, "max-requests") && restriction >= 1 && restriction <= 16)
+            c->max_requests = restriction;
+        else if (!strcmp(key, "fixed-requests") && restriction <= 16)
+            c->fixed_requests = restriction;
+        else if (!strcmp(key, "receive-mode") && restriction <= 2)
+            c->receive_mode = restriction;
+        else if (!strcmp(key, "http-mode") && restriction <= 3)
+            c->http_mode = restriction;
+        else
+            return false;
+        return true;
+    }
+    if (!strcmp(key, "explore") && node->format == MPV_FORMAT_FLAG) {
+        c->explore = node->u.flag;
+        return true;
+    }
+    if (!strcmp(key, "receive-bytes")) {
+        if (!count || node->u.int64 < (1 << 20) || node->u.int64 > (16 << 20))
+            return false;
+        c->receive_bytes = node->u.int64;
+        return true;
+    }
+    if (!strcmp(key, "primary-origin")) {
+        if (node->format != MPV_FORMAT_STRING || !mp_curl_valid_origin(node->u.string))
+            return false;
+        snprintf(c->primary_origin, sizeof(c->primary_origin), "%s", node->u.string);
+        return true;
+    }
+    if (!strcmp(key, "transport-samples")) {
+        if (node->format != MPV_FORMAT_NODE_ARRAY || node->u.list->num > MP_CURL_MAX_SAMPLES)
+            return false;
+        c->num_samples = node->u.list->num;
+        for (int n = 0; n < c->num_samples; n++) {
+            struct mpv_node *row = &node->u.list->values[n];
+            if (row->format != MPV_FORMAT_NODE_MAP)
+                return false;
+            for (int f = 0; f < row->u.list->num; f++) {
+                for (int previous = 0; previous < f; previous++) {
+                    if (!strcmp(row->u.list->keys[previous], row->u.list->keys[f]))
+                        return false;
+                }
+                if (!curl_sample_field(&row->u.list->values[f], row->u.list->keys[f], &c->samples[n]))
+                    return false;
+            }
+            if (!c->samples[n].requests || !c->samples[n].ordered_bps ||
+                !c->samples[n].samples || !c->samples[n].source ||
+                (c->samples[n].source == 2 && (!c->samples[n].range_bytes || !c->samples[n].http_version)))
+                return false;
+        }
         return true;
     }
     if (!strcmp(key, "source-bitrate") || !strcmp(key, "delivery-bitrate")) {
@@ -1999,12 +2172,20 @@ static int mp_property_curl_transport_control(void *ctx,
     {
         return M_PROPERTY_ERROR;
     }
-    struct mp_curl_control control = { .op = op->u.int64 };
+    struct mp_curl_control control = { .op = op->u.int64,
+        .max_requests = 4, .explore = true, .receive_mode = 1,
+        .receive_bytes = 4 << 20 };
     for (int n = 0; n < map->u.list->num; n++) {
+        for (int previous = 0; previous < n; previous++) {
+            if (!strcmp(map->u.list->keys[previous], map->u.list->keys[n]))
+                return M_PROPERTY_ERROR;
+        }
         if (!curl_control_field(&map->u.list->values[n], map->u.list->keys[n],
                                 &control))
             return M_PROPERTY_ERROR;
     }
+    if (control.fixed_requests > control.max_requests)
+        return M_PROPERTY_ERROR;
     return mp_curl_set_control(mpctx->global, &control)
         ? M_PROPERTY_OK : M_PROPERTY_ERROR;
 }
@@ -5080,6 +5261,7 @@ static const struct m_property mp_properties_base[] = {
     {"demuxer-cache-state", mp_property_demuxer_cache_state},
 #if HAVE_LIBCURL
     {"curl-transport-metrics", mp_property_curl_transport_metrics},
+    {"curl-transport-capabilities", mp_property_curl_transport_capabilities},
     {"curl-transport-control", mp_property_curl_transport_control},
 #endif
     {"cache-buffering-state", mp_property_cache_buffering},

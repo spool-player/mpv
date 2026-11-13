@@ -158,6 +158,12 @@ paths = executable('paths', 'paths.c', include_directories: incdir,
 test('paths', paths)
 
 if features['libcurl']
+    curl_budget = executable('curl-budget', files('curl_budget.c', '../stream/curl_budget.c'), include_directories: incdir)
+    test('curl-budget', curl_budget)
+    curl_controller = executable('curl-controller', files('curl_controller.c', '../stream/curl_controller.c'), include_directories: incdir, dependencies: libm)
+    test('curl-controller', curl_controller)
+    curl_policy = executable('curl-policy', files('curl_policy.c', '../stream/curl_policy.c'), include_directories: incdir, dependencies: libm)
+    test('curl-policy', curl_policy)
     avio_crypto_objects = libmpv.extract_objects('demux/avio_crypto.c')
     avio_crypto = executable('avio-crypto', files('avio_crypto.c'),
                              include_directories: incdir,

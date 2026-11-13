@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 
 
 class Node(C.Structure):
@@ -71,12 +72,21 @@ def decode(node):
 
 def encode(value, keep):
     node = Node()
-    if isinstance(value, bool):
+    if isinstance(value, str):
+        encoded = value.encode()
+        keep.append(encoded)
+        node.format, node.u.string = 1, encoded
+    elif isinstance(value, bool):
         node.format, node.u.flag = 3, value
     elif isinstance(value, int):
         node.format, node.u.int64 = 4, value
     elif isinstance(value, float):
         node.format, node.u.double = 5, value
+    elif isinstance(value, list):
+        values = (Node * len(value))(*(encode(v, keep) for v in value))
+        entries = NodeList(len(value), values, None)
+        keep.extend((values, entries))
+        node.format, node.u.list = 7, C.pointer(entries)
     elif isinstance(value, dict):
         values = (Node * len(value))(*(encode(v, keep) for v in value.values()))
         keys = (C.c_char_p * len(value))(*(k.encode() for k in value))
@@ -90,6 +100,10 @@ def encode(value, keep):
 
 class Player:
     def __init__(self, library, **options):
+        self.initial_requests = int(options.pop("initial_requests", 0))
+        self.delivery_bitrate = float(options.pop("delivery_bitrate", 0))
+        self.prior_ttfb_ms = float(options.pop("prior_ttfb_ms", 0))
+        self.maximum_requests = int(options.get("curl-parallel-requests", 4))
         self.lib = C.CDLL(library)
         self.lib.mpv_create.restype = C.c_void_p
         signatures = {
@@ -113,7 +127,7 @@ class Player:
                     "ao-null-untimed": "yes", "idle": "yes", "cache": "yes",
                     "demuxer-max-bytes": "64KiB", "demuxer-readahead-secs": "0.1",
                     "curl-enabled": "yes", "curl-max-request-size": "256KiB",
-                    "curl-buffer-size": "1MiB", "curl-parallel-requests": "4"}
+                    "curl-buffer-size": "8MiB", "curl-parallel-requests": "4"}
         defaults.update(options)
         try:
             for key, value in defaults.items():
@@ -161,6 +175,20 @@ class Player:
                    "configure")
 
     def play(self, url, loaded=None, timeout=90):
+        if self.initial_requests or self.delivery_bitrate:
+            current = self.get("curl-transport-metrics") or {}
+            epoch = current.get("playback-epoch", 0) + 1
+            parts = urllib.parse.urlsplit(url)
+            authority = f"{parts.scheme}://{parts.hostname}:{parts.port}"
+            priors = []
+            if self.initial_requests:
+                priors.append({"requests": self.initial_requests, "http-version": 0,
+                    "receive-profile": 0, "receive-bytes": 0, "range-bytes": 0,
+                    "ordered-bytes-per-second": 1 << 20, "ttfb-ms": self.prior_ttfb_ms,
+                    "updated-at-ms": int(time.time() * 1000), "source": 1, "samples": 1})
+            self.configure(epoch, max_requests=self.maximum_requests,
+                primary_origin=authority, delivery_bitrate=self.delivery_bitrate,
+                transport_samples=priors)
         started = time.monotonic()
         self.command("loadfile", url)
         samples = []
@@ -385,11 +413,7 @@ class CurlTransport(unittest.TestCase):
             player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
                                        "ao-pcm-waveheader": "no", "audio-format": "s16"})
             try:
-                # Keep the same assertions runnable against the old library,
-                # while exercising reordered dynamic callbacks on the new one.
-                if player.get("option-info/curl-initial-requests") is not None:
-                    player.set("options/curl-initial-requests", "4")
-                    player.set("options/curl-startup-requests", "4")
+                player.set("options/curl-fixed-requests", "4")
                 result = player.play(origin.url)
                 metrics = result["metrics"]
                 wall_rate = metrics["received-bytes"] / result["seconds"]
@@ -473,7 +497,7 @@ class CurlTransport(unittest.TestCase):
                 output = pathlib.Path(directory) / "actual.pcm"
                 player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
                                            "ao-pcm-waveheader": "no", "audio-format": "s16",
-                                           "curl-adaptive": "no"})
+                                           "curl-fixed-requests": "4"})
                 try:
                     metrics = player.play(origin.url)["metrics"]
                     self.assertGreater(metrics["retry-attempts"], 0)
@@ -488,7 +512,7 @@ class CurlTransport(unittest.TestCase):
         mib = 1 << 20
         with Origin(size=8 << 20, latency=0.01, per_lane=4 << 20, etag='"v1"',
                     pause=(mib + mib // 2, 3.0)) as origin:
-            player = Player(LIBRARY, **{"curl-adaptive": "no", "curl-max-request-size": "1MiB",
+            player = Player(LIBRARY, **{"curl-fixed-requests": "4", "curl-max-request-size": "1MiB",
                                        "curl-buffer-size": "8MiB"})
             try:
                 result = player.play(origin.url)
@@ -542,7 +566,7 @@ class CurlTransport(unittest.TestCase):
             output = pathlib.Path(directory) / "actual.pcm"
             player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
                                        "ao-pcm-waveheader": "no", "audio-format": "s16",
-                                       "curl-adaptive": "no", "curl-max-request-size": "1MiB",
+                                       "curl-fixed-requests": "4", "curl-max-request-size": "1MiB",
                                        "curl-buffer-size": "8MiB"})
             try:
                 result = player.play(origin.url)
@@ -553,7 +577,9 @@ class CurlTransport(unittest.TestCase):
             during = [position for at, position in result["positions"]
                       if paused + 1.0 <= at <= resumed - 0.2]
             self.assertTrue(during, "playback reached the incomplete leading range")
-            self.assertLessEqual(max(during), (7 * mib - 44) / 192000 + 0.1)
+            paused_range = next((start, end) for start, end in origin.requests
+                if start <= origin.pause[0] < end)
+            self.assertLessEqual(max(during), (paused_range[0] - 44) / 192000 + 0.1)
             self.assertEqual(output.read_bytes(), origin.pcm)
 
     def test_seek_during_partial_publication_delivers_exact_bytes(self):
@@ -565,7 +591,7 @@ class CurlTransport(unittest.TestCase):
                     pause=(mib + mib // 2, 3.0)) as origin, tempfile.TemporaryDirectory() as directory:
             output = pathlib.Path(directory) / "actual.pcm"
             player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output, "ao-pcm-waveheader": "no",
-                                       "audio-format": "s16", "curl-adaptive": "no",
+                                       "audio-format": "s16", "curl-fixed-requests": "4",
                                        "curl-max-request-size": "1MiB", "curl-buffer-size": "8MiB"})
             target = 2.0
 
@@ -596,7 +622,7 @@ class CurlTransport(unittest.TestCase):
                 output = pathlib.Path(directory) / "actual.pcm"
                 player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
                                            "ao-pcm-waveheader": "no", "audio-format": "s16",
-                                           "curl-adaptive": "no"})
+                                           "curl-fixed-requests": "4"})
                 try:
                     player.play(origin.url)
                 finally:
@@ -630,7 +656,7 @@ class CurlTransport(unittest.TestCase):
                 output = pathlib.Path(directory) / "actual.pcm"
                 player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
                                            "ao-pcm-waveheader": "no", "audio-format": "s16",
-                                           "curl-adaptive": "no"})
+                                           "curl-fixed-requests": "4"})
                 try:
                     metrics = player.play(origin.url)["metrics"]
                 finally:
@@ -651,7 +677,7 @@ class CurlTransport(unittest.TestCase):
                 output = pathlib.Path(directory) / "actual.pcm"
                 player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
                                            "ao-pcm-waveheader": "no", "audio-format": "s16",
-                                           "curl-adaptive": "no", "curl-max-retries": "0"})
+                                           "curl-fixed-requests": "4", "curl-max-retries": "0"})
                 try:
                     metrics = player.play(origin.url)["metrics"]
                 finally:
@@ -670,7 +696,7 @@ class CurlTransport(unittest.TestCase):
                 output = pathlib.Path(directory) / "actual.pcm"
                 player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
                                            "ao-pcm-waveheader": "no", "audio-format": "s16",
-                                           "curl-adaptive": "no"})
+                                           "curl-fixed-requests": "4"})
                 try:
                     player.play(origin.url)
                 finally:
@@ -690,7 +716,7 @@ class CurlTransport(unittest.TestCase):
                 output = pathlib.Path(directory) / "actual.pcm"
                 player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
                                            "ao-pcm-waveheader": "no", "audio-format": "s16",
-                                           "curl-adaptive": "no", "curl-max-retries": "1"})
+                                           "curl-fixed-requests": "4", "curl-max-retries": "1"})
                 try:
                     with contextlib.suppress(AssertionError):
                         player.play(origin.url, timeout=30)
@@ -733,6 +759,71 @@ class CurlTransport(unittest.TestCase):
             self.assertGreater(demand, 1536000 * 0.75)
             self.assertLess(demand, 1536000 * 1.25)
 
+    def test_fixed_receive_windows_are_applied_before_connect_and_clamps_are_reported(self):
+        # This owns the real socket contract, including Linux's doubled
+        # accounting. User-space curl buffer settings cannot make it pass.
+        for mode in ("os-auto", "measured", "fixed"):
+            with self.subTest(mode=mode), Origin(size=4 << 20, latency=.04) as origin, tempfile.TemporaryDirectory() as directory:
+                output = pathlib.Path(directory) / "receive-window.pcm"
+                player = Player(LIBRARY, **{"curl-fixed-requests": "4",
+                    "curl-receive-mode": mode, "curl-receive-bytes": "4MiB",
+                    "ao": "pcm", "ao-pcm-file": output,
+                    "ao-pcm-waveheader": "no", "audio-format": "s16"})
+                try:
+                    receive_mode = 2 if mode == "fixed" else 1 if mode == "measured" else 0
+                    player.configure(1, max_requests=4, fixed_requests=4,
+                        receive_mode=receive_mode, receive_bytes=4 << 20)
+                    player.check(player.transport_control({"format": 2, "op": 1,
+                        "playback-epoch": 1, "joint-extra-grant-bytes": 64 << 20,
+                        "background-network": False}), "grant")
+                    result = player.play(origin.url)
+                finally:
+                    player.close()
+                connections = [row for _, metrics in result["samples"]
+                    for row in metrics["connections"] if row["socket-generation"]]
+                self.assertTrue(connections)
+                for row in connections:
+                    requested = row["receive-requested-bytes"]
+                    self.assertEqual(requested, 4 << 20 if mode == "fixed" else 0)
+                    effective = row["receive-effective-bytes"]
+                    self.assertGreater(effective, 0)
+                    if mode == "fixed":
+                        accounted = effective // 2 if sys.platform.startswith("linux") else effective
+                        self.assertEqual(row["receive-status"], 1 if accounted >= requested else 2)
+                    else:
+                        self.assertEqual(row["receive-status"], 0)
+                self.assertEqual(output.read_bytes(), origin.pcm)
+
+    def test_transport_restrictions_are_validated_atomically(self):
+        player = Player(LIBRARY)
+        try:
+            player.configure(1, max_requests=3, fixed_requests=2,
+                explore=False, http_mode=2, receive_mode=2, receive_bytes=4 << 20,
+                primary_origin="https://example.invalid:443", transport_samples=[])
+            for bad in ({"max-requests": 0}, {"max-requests": 17},
+                        {"max-requests": 2, "fixed-requests": 3},
+                        {"receive-mode": 3}, {"receive-bytes": 1024},
+                        {"receive-bytes": 17 << 20}, {"http-mode": 4},
+                        {"explore": 1}, {"primary-origin": "https://example.invalid/media"},
+                        {"primary-origin": "https://user:password@example.invalid"},
+                        {"transport-samples": [{}]},
+                        {"transport-samples": [0]},
+                        {"joint-extra-grant-bytes": 1}):
+                with self.subTest(fields=tuple(bad)):
+                    self.assertLess(player.transport_control(
+                        {"format": 2, "op": 0, "playback-epoch": 2, **bad}), 0)
+                    self.assertEqual(player.get("curl-transport-metrics")["playback-epoch"], 1)
+            sample = {"requests": 2, "http-version": 20, "receive-profile": 0,
+                      "receive-bytes": 0, "range-bytes": 524288,
+                      "ordered-bytes-per-second": 8000000, "ttfb-ms": 70.0,
+                      "updated-at-ms": int(time.time() * 1000), "source": 2, "samples": 3}
+            player.configure(2, transport_samples=[sample])
+            self.assertEqual(player.get("curl-transport-metrics")["playback-epoch"], 2)
+            self.assertLess(player.transport_control({"format": 2, "op": 1,
+                "playback-epoch": 2, "joint-extra-grant-bytes": 129 << 20}), 0)
+        finally:
+            player.close()
+
     def test_socket_and_host_probes_match_the_kernel(self):
         # RTT comes from the kernel's TCP state, not request timing, and host
         # receive ceilings and AES support are what the system reports.
@@ -766,8 +857,7 @@ class CurlTransport(unittest.TestCase):
         # or malformed controls change nothing. Background host traffic makes
         # capacity evidence invalid while it lasts.
         with Origin(size=8 << 20, latency=0.02, per_lane=256 << 10) as origin:
-            player = Player(LIBRARY, **{"ao-null-untimed": "no", "curl-initial-requests": "4",
-                                       "curl-startup-requests": "4"})
+            player = Player(LIBRARY, **{"ao-null-untimed": "no", "initial_requests": "4",})
             checks = {}
 
             def control(current):
@@ -795,14 +885,14 @@ class CurlTransport(unittest.TestCase):
                 result = player.play(origin.url, loaded=control)
             finally:
                 player.close()
-            self.assertGreaterEqual(checks["duplicate"], 0)
+            self.assertLess(checks["duplicate"], 0)
             self.assertLess(checks["conflict"], 0)
-            self.assertGreaterEqual(checks["stale"], 0)
+            self.assertLess(checks["stale"], 0)
             self.assertTrue(all(code < 0 for code in checks["malformed"]))
             after = checks["after"]
             self.assertEqual(after["playback-epoch"], 5)
             self.assertEqual(after["stale-controls"], 1)
-            self.assertEqual(after["rejected-controls"], 1)
+            self.assertEqual(after["rejected-controls"], 2)
             self.assertAlmostEqual(after["declared-bits-per-second"], 20e6, delta=1)
             self.assertAlmostEqual(after["playback-demand-bits-per-second"], 20e6, delta=1)
             metrics = result["metrics"]
@@ -823,7 +913,7 @@ class CurlTransport(unittest.TestCase):
                             "-addext", "subjectAltName=IP:127.0.0.1", "-keyout", tls / "key.pem",
                             "-out", tls / "cert.pem"], check=True, capture_output=True)
             options = {"tls-ca-file": tls / "cert.pem", "tls-verify": "yes",
-                       "curl-adaptive": "no", "curl-parallel-requests": "1"}
+                       "curl-fixed-requests": "1", "curl-parallel-requests": "1"}
             with Origin(size=1 << 20, tls=tls) as origin:
                 first = Player(LIBRARY, **options)
                 try:
@@ -861,7 +951,7 @@ class CurlTransport(unittest.TestCase):
             output = pathlib.Path(directory) / "actual.pcm"
             player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
                                        "ao-pcm-waveheader": "no", "audio-format": "s16",
-                                       "curl-adaptive": "no", "network-timeout": "1"})
+                                       "curl-fixed-requests": "4", "network-timeout": "1"})
             try:
                 result = player.play(origin.url, timeout=STALL_SECONDS - 5)
                 self.assertGreater(result["metrics"]["retry-attempts"], 0)
@@ -872,7 +962,7 @@ class CurlTransport(unittest.TestCase):
     def test_adapts_per_lane_limit_and_reverts_serialization(self):
         for serialized in (False, True):
             with self.subTest(serialized=serialized), Origin(size=10 << 20, latency=0.08, per_lane=1 << 20, serialized=serialized) as origin:
-                player = Player(LIBRARY, **{"curl-media-bitrate": "48000000"})
+                player = Player(LIBRARY, **{"delivery_bitrate": "48000000"})
                 try:
                     result = player.play(origin.url)
                     choices = [sample[1]["selected-requests"] for sample in result["samples"]]
@@ -891,9 +981,8 @@ class CurlTransport(unittest.TestCase):
         # bitrate target. The real HTTP origin is slower with more requests.
         with Origin(size=24 << 20, latency=0.02, per_lane=1 << 20,
                     contention=True) as origin:
-            player = Player(LIBRARY, **{"curl-initial-requests": "4",
-                                       "curl-startup-requests": "1",
-                                       "curl-media-bitrate": "48000000"})
+            player = Player(LIBRARY, **{"initial_requests": "4",
+                                       "delivery_bitrate": "48000000"})
             try:
                 result = player.play(origin.url)
                 metrics = result["metrics"]
@@ -913,9 +1002,8 @@ class CurlTransport(unittest.TestCase):
         # six seconds, repeatedly starving the consumer.
         with Origin(size=24 << 20, latency=0.02, per_lane=512 << 10) as origin:
             player = Player(LIBRARY, **{"curl-parallel-requests": "2",
-                                       "curl-initial-requests": "2",
-                                       "curl-startup-requests": "1",
-                                       "curl-media-bitrate": "48000000"})
+                                       "initial_requests": "2",
+                                       "delivery_bitrate": "48000000"})
             try:
                 result = player.play(origin.url)
                 metrics = result["metrics"]
@@ -946,12 +1034,11 @@ class CurlTransport(unittest.TestCase):
         # must accumulate actual active transfers across those idle gaps.
         with Origin(size=8 << 20, latency=0.02, per_lane=256 << 10) as origin:
             player = Player(LIBRARY, **{"ao-null-untimed": "no",
-                                       "curl-initial-requests": "4",
-                                       "curl-startup-requests": "4",
-                                       "curl-media-bitrate": "1536000"})
+                                       "initial_requests": "4",
+                                       "delivery_bitrate": "1536000"})
             try:
                 result = player.play(origin.url,
-                    loaded=lambda current: current.configure(1, delivery_bitrate=1536000.0))
+                    loaded=lambda current: current.configure(2, delivery_bitrate=1536000.0))
                 metrics = result["metrics"]
                 points = metrics["concurrency-samples"]
                 self.assertGreater(metrics["capacity-samples"], 0)
@@ -974,10 +1061,9 @@ def benchmark(library):
     for name, settings in scenarios.items():
         for lanes in (1, 2, 4):
             with Origin(**settings) as origin:
-                player = Player(library, **{"curl-initial-requests": lanes,
-                                            "curl-startup-requests": lanes,
-                                            "curl-ttfb-ms": settings["latency"] * 1000,
-                                            "curl-media-bitrate": "12000000"})
+                player = Player(library, **{"curl-fixed-requests": lanes,
+                                            "prior_ttfb_ms": settings["latency"] * 1000,
+                                            "delivery_bitrate": "12000000"})
                 try:
                     result = player.play(origin.url)
                     metrics = result["metrics"]

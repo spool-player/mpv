@@ -3148,6 +3148,13 @@ static void validate_http_response(struct priv *p, struct bstr line)
                 p->request_start, p->primary_end - 1, resp);
     }
     p->response_ok = valid;
+    if (valid && resp == 206 && p->dynamic_supported && !p->dynamic_started) {
+        // A seek request can be capped below its requested end. Schedule
+        // later ranges only after learning the actual primary reply end;
+        // using the planned end here would leave a permanent byte gap.
+        p->primary_end = end;
+        cmd_async(p, CMD_START_DYNAMIC);
+    }
 }
 
 // Called per header line.
@@ -3305,8 +3312,6 @@ static void start_request(struct priv *p)
     }
     begin_measurement(&p->primary_ref);
     p->active = true;
-    if (p->probed && p->dynamic_supported)
-        start_dynamic(p);
 }
 
 static uint64_t dynamic_limit(const struct priv *p)
@@ -4193,9 +4198,13 @@ static void on_done(struct priv *p, CURLcode code)
                 start_dynamic(p);
             if (p->dynamic_started) {
                 if (p->request_start != p->primary_end) {
-                    MP_WARN(p, "primary range ended at unexpected offset; "
-                               "continuing with one request\n");
-                    cmd_async(p, CMD_FALLBACK_DYNAMIC);
+                    // A valid capped suffix may need several primary replies
+                    // before reaching the already scheduled queue boundary.
+                    if (received && p->request_start < p->primary_end) {
+                        start_request(p);
+                    } else {
+                        cmd_async(p, CMD_FALLBACK_DYNAMIC);
+                    }
                     return;
                 }
                 fill_dynamic(p);

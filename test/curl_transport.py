@@ -944,7 +944,12 @@ class CurlTransport(unittest.TestCase):
                     player.play(origin.url)
                 finally:
                     player.close()
-                self.assertEqual(output.read_bytes(), origin.pcm)
+                actual = output.read_bytes()
+            if actual != origin.pcm:
+                first = next((n for n, (left, right) in enumerate(zip(actual, origin.pcm)) if left != right),
+                             min(len(actual), len(origin.pcm)))
+                self.fail(f"PCM coverage differs at {first}; actual={len(actual)}, expected={len(origin.pcm)}, "
+                          f"requests={origin.requests[:20]}")
 
     def test_stalled_transfer_is_retried_after_network_timeout(self):
         with Origin(size=2 << 20, fault="stall") as origin, tempfile.TemporaryDirectory() as directory:

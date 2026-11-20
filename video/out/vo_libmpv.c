@@ -124,9 +124,7 @@ static const struct render_backend_fns *render_backends_gpu[] = {
 };
 
 static const struct render_backend_fns *render_backends_gpu_next[] = {
-#if HAVE_GL && defined(PL_HAVE_OPENGL)
     &render_backend_gpu_next,
-#endif
     NULL
 };
 

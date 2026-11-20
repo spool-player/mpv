@@ -281,6 +281,7 @@ sources = files(
     'video/out/vo_gpu_next.c',
     'video/out/gpu_next/context.c',
     'video/out/gpu_next/video.c',
+    'video/out/gpu_next/libmpv_gpu_next.c',
 
     ## osdep
     'osdep/io.c',

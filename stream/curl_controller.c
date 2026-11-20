@@ -268,7 +268,8 @@ static uint64_t minimum(uint64_t a, uint64_t b)
     return a < b ? a : b;
 }
 
-static bool shape(struct mp_curl_controller *c, const struct mp_curl_observation *o, int candidate, bool consuming)
+static bool shape(struct mp_curl_controller *c, const struct mp_curl_observation *o, int candidate, bool consuming,
+                  bool recycled)
 {
     if (!o->resources_valid) {
         c->reason = MP_CURL_REASON_HEADROOM;
@@ -279,9 +280,8 @@ static bool shape(struct mp_curl_controller *c, const struct mp_curl_observation
     // reserve one lane set plus a leading safety descriptor, not every range
     // in all three batches. Full-cache comparisons retain all six lane sets.
     int descriptors = consuming ? k + 1 : 6 * k;
-    // While playback drains the queue its descriptors are recycled into the
-    // trial as they free, so none need be free when it is decided.
-    bool recycled = consuming && !o->paused && !o->eof && o->buffer_valid;
+    // An exploration while playback drains a full queue reuses descriptors
+    // as they free, so none need be free when it is decided.
     if (!recycled && o->free_descriptors < descriptors) {
         c->reason = MP_CURL_REASON_DESCRIPTORS;
         return false;
@@ -525,7 +525,7 @@ int mp_curl_controller_decide(struct mp_curl_controller *c, const struct mp_curl
     // A trial while playback runs drains with the consumer, which is what a
     // full ring of buffered ranges needs: its descriptors free as it plays.
     bool playing = !o->paused && !o->eof && o->buffer_valid;
-    if (!shape(c, o, candidate, recovery || playing)) {
+    if (!shape(c, o, candidate, recovery || playing, playing && !recovery)) {
         c->action = MP_CURL_DEFER;
         return selected;
     }

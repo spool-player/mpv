@@ -1314,6 +1314,8 @@ static void run_cmd(void *arg)
                                            c->p->opts->parallel_requests);
         // One stream never gets one full ring per lane. Shape the queue
         // against the same per-stream bound after host restrictions apply.
+        // Small enough that a full queue of them fits the baseline budget;
+        // size_ranges() grows them once a long, fast path is measured.
         c->p->segment_size = MPMIN(c->p->opts->max_request_size,
             MPMIN(512 << 10, c->p->buffer_size / c->p->opts->parallel_requests));
         if (ctx->epoch && ctx->configured.primary_origin[0]) {
@@ -3501,6 +3503,39 @@ static struct mp_curl_observation stream_observation(struct priv *p, int64_t now
     return o;
 }
 
+// Size ordinary ranges to the path: each takes a request's round trip, so a
+// range should carry about eight round trips of a lane's measured rate. On a long,
+// fast path a fixed 512 KiB range spends most of its time waiting for the
+// next response. Bounded by the request limit, 16 MiB and half of the raw
+// budget across all lanes; only ever grown, by factors of two or more, so a
+// short path keeps the small ranges its memory budget was shaped for.
+static void size_ranges(struct priv *p)
+{
+    if (p->control_phase || p->startup || p->transitioning || p->opts->max_request_size <= 0)
+        return;
+    int lanes = MPCLAMP(p->selected_requests, 1, 16);
+    double capacity = p->controller.counts[lanes - 1].capacity;
+    double rtt = MPMAX(p->ttfb_ms, 0) / 1000;
+    // Short paths keep the ranges the queue and its memory were shaped for.
+    if (!(capacity > 0) || !(rtt >= .1) || p->paused)
+        return;
+    uint64_t budget = p->ctx->budget.baseline + p->ctx->budget.desired_extra;
+    uint64_t upper = MPMIN(MPMIN((uint64_t)p->opts->max_request_size, 16 << 20),
+                           budget / (2 * (uint64_t)p->opts->parallel_requests));
+    uint64_t lower = MPMAX(p->segment_size, 1);
+    if (upper <= lower)
+        return;
+    uint64_t target = (uint64_t)MPCLAMP(capacity / lanes * rtt * 8, lower, upper);
+    uint64_t size = lower;
+    while (size * 2 <= target)
+        size *= 2;
+    if (size >= p->segment_size * 2) {
+        MP_VERBOSE(p, "range size %zu -> %" PRIu64 " (rtt %.0f ms)\n",
+                   p->segment_size, size, rtt * 1000);
+        p->segment_size = size;
+    }
+}
+
 static void update_adaptation(struct priv *p)
 {
     struct curl_ctx *ctx = p->ctx;
@@ -3835,6 +3870,7 @@ static void fill_dynamic(struct priv *p)
         mp_mutex_unlock(&p->mtx);
     }
     update_adaptation(p);
+    size_ranges(p);
     // Drain a configuration generation before beginning the next trial.
     // Otherwise a new request can contribute only half its time/body.
     if (p->transitioning)

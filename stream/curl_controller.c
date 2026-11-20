@@ -483,11 +483,14 @@ int mp_curl_controller_decide(struct mp_curl_controller *c, const struct mp_curl
     }
     int candidate = selected;
     int reason = MP_CURL_REASON_NONE;
-    bool pressure = (o->hol_ratio > .2 && o->reorder_growing)
-        || (o->worker_cpu_available && o->worker_cpu >= .85 && previous > 0 && o->capacity < previous * .95);
     bool short_of_demand = recovery && o->demand_bps > 0 && o->capacity < 1.75 * o->demand_bps / 8;
+    // Head-of-line waits grow with range size on long paths. Short of demand
+    // they are the price of throughput, not a reason to shed requests.
+    bool hol_pressure = o->hol_ratio > .2 && o->reorder_growing && !short_of_demand;
+    bool pressure = hol_pressure
+        || (o->worker_cpu_available && o->worker_cpu >= .85 && previous > 0 && o->capacity < previous * .95);
     bool more = short_of_demand && o->network_wait_available
-        && o->network_wait_ratio >= .5 && o->storage_ratio < .05 && o->hol_ratio < .1
+        && o->network_wait_ratio >= .5 && o->storage_ratio < .05 && o->hol_ratio < (short_of_demand ? .5 : .1)
         && (!o->worker_cpu_available || o->worker_cpu < .7) && selected < o->max_requests
         && !rejected(&c->counts[selected], o);
     // Short of demand with no useful step up, a learned count must still be
@@ -498,7 +501,7 @@ int mp_curl_controller_decide(struct mp_curl_controller *c, const struct mp_curl
         && (!c->last_trial_ns || o->now_ns - c->last_trial_ns >= 2 * SECOND);
     if (pressure && selected > 1) {
         candidate--;
-        reason = o->hol_ratio > .2 ? MP_CURL_REASON_HOL : MP_CURL_REASON_CPU;
+        reason = hol_pressure ? MP_CURL_REASON_HOL : MP_CURL_REASON_CPU;
         recovery = true;
     } else if (more) {
         candidate++;

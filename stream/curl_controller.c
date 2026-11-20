@@ -548,7 +548,10 @@ int mp_curl_controller_decide(struct mp_curl_controller *c, const struct mp_curl
     double pace = fmax(o->capacity, 1);
     if (!recovery && o->demand_bps > 0)
         pace = fmin(pace, o->demand_bps / 8);
-    double deadline = clamp(2 * (3 * c->batch_bytes + queued) / pace, 2, recovery ? 16 : 30);
+    // Each phase also waits for its new requests' first bytes, which on a
+    // far or slow-to-answer server is seconds the byte count cannot show.
+    double setup = fmax(0, o->ttfb_ms) / 1000 + 2 * fmax(0, o->rtt_ms) / 1000;
+    double deadline = clamp(2 * (3 * c->batch_bytes + queued) / pace + 6 * setup, 2, recovery ? 16 : 30);
     // Until its first phase starts, the trial may wait out one more deadline
     // for the requests already in flight to drain.
     c->trial_duration_ns = (int64_t)(deadline * SECOND);

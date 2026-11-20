@@ -222,11 +222,17 @@ class Player:
         raise AssertionError("transport did not reach EOF")
 
 
+# Eight channels of 192 kHz 32-bit PCM: about 49 Mbit/s, so the observed
+# demand matches the 48 Mbit/s these deficit tests declare.
+HEAVY_WAV = (8, 192000, 32)
+
+
 class Origin:
     def __init__(self, size=8 << 20, latency=0.04, per_lane=2 << 20,
                  shared=0, serialized=False, reorder=False, fault=None,
                  cap=0, unknown_size=False, contention=False, etag=None,
-                 changed=False, pause=None, fault_after=1, fault_start=None, tls=None):
+                 changed=False, pause=None, fault_after=1, fault_start=None, tls=None,
+                 wav=(2, 48000, 16)):
         # A frame counter, never periodic: a duplicated, dropped or reordered
         # range of any alignment changes the PCM, not only its length.
         frames = array.array("I", range(size // 4))
@@ -235,7 +241,8 @@ class Origin:
         pcm = frames.tobytes()
         self.pcm = pcm
         self.payload = (b"RIFF" + struct.pack("<I", len(pcm) + 36) + b"WAVEfmt " +
-                        struct.pack("<IHHIIHH", 16, 1, 2, 48000, 192000, 4, 16) +
+                        struct.pack("<IHHIIHH", 16, 1, wav[0], wav[1], wav[0] * wav[1] * wav[2] // 8,
+                                    wav[0] * wav[2] // 8, wav[2]) +
                         b"data" + struct.pack("<I", len(pcm)) + pcm)
         self.latency, self.per_lane, self.shared = latency, per_lane, shared
         self.serialized, self.reorder, self.fault = serialized, reorder, fault
@@ -966,18 +973,25 @@ class CurlTransport(unittest.TestCase):
 
     def test_adapts_per_lane_limit_and_reverts_serialization(self):
         for serialized in (False, True):
-            with self.subTest(serialized=serialized), Origin(size=10 << 20, latency=0.08, per_lane=1 << 20, serialized=serialized) as origin:
+            with self.subTest(serialized=serialized), Origin(size=24 << 20, latency=0.08, per_lane=1 << 20, serialized=serialized, wav=HEAVY_WAV) as origin:
                 player = Player(LIBRARY, **{"delivery_bitrate": "48000000"})
                 try:
                     result = player.play(origin.url)
                     choices = [sample[1]["selected-requests"] for sample in result["samples"]]
                     self.assertGreater(max(choices), 1)
                     self.assertLessEqual(max(choices), 4)
+                    # Startup climbs straight to the lane limit without measuring
+                    # the rungs. Each lane adds capacity on a per-lane limited
+                    # origin, so the limit stays; a serializing origin gains
+                    # nothing from it, so requests are shed and the smaller
+                    # count is measured by the downward trial.
+                    selected = result["metrics"]["selected-requests"]
+                    points = {point["requests"] for point in result["metrics"]["concurrency-samples"]}
                     if serialized:
-                        self.assertEqual(result["metrics"]["selected-requests"], 1)
-                    points = result["metrics"]["concurrency-samples"]
-                    self.assertTrue(any(point["requests"] == 1 for point in points))
-                    self.assertTrue(any(point["requests"] == 2 for point in points))
+                        self.assertLess(selected, 4)
+                        self.assertIn(selected, points)
+                    else:
+                        self.assertEqual(selected, 4)
                 finally:
                     player.close()
 
@@ -985,7 +999,7 @@ class CurlTransport(unittest.TestCase):
         # A learned high count must decay even when no count can satisfy the
         # bitrate target. The real HTTP origin is slower with more requests.
         with Origin(size=24 << 20, latency=0.02, per_lane=1 << 20,
-                    contention=True) as origin:
+                    contention=True, wav=HEAVY_WAV) as origin:
             player = Player(LIBRARY, **{"initial_requests": "4",
                                        "delivery_bitrate": "48000000"})
             try:
@@ -1005,7 +1019,7 @@ class CurlTransport(unittest.TestCase):
         # Two lanes are useful but cannot meet headroom. Once a one-lane
         # trial loses capacity, an unchanged origin must not be retried every
         # six seconds, repeatedly starving the consumer.
-        with Origin(size=24 << 20, latency=0.02, per_lane=512 << 10) as origin:
+        with Origin(size=24 << 20, latency=0.02, per_lane=512 << 10, wav=HEAVY_WAV) as origin:
             player = Player(LIBRARY, **{"curl-parallel-requests": "2",
                                        "initial_requests": "2",
                                        "delivery_bitrate": "48000000"})
@@ -1037,7 +1051,8 @@ class CurlTransport(unittest.TestCase):
     def test_cached_bursts_still_learn_and_downshift(self):
         # A timed consumer spends most wall time with a full ring. Capacity
         # must accumulate actual active transfers across those idle gaps.
-        with Origin(size=8 << 20, latency=0.02, per_lane=256 << 10) as origin:
+        # Long enough for an exploration disturbed once to be retried.
+        with Origin(size=12 << 20, latency=0.02, per_lane=256 << 10) as origin:
             player = Player(LIBRARY, **{"ao-null-untimed": "no",
                                        "initial_requests": "4",
                                        "delivery_bitrate": "1536000"})

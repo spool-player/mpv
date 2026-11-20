@@ -79,7 +79,7 @@ struct mp_curl_controller {
     int64_t epoch, profile_generation, last_trial_ns, started_ns, last_now_ns;
     int64_t stable_since_ns, negative_since_ns, deficit_since_ns, last_decision_ns;
     int64_t prefix_progress_ns, last_buffer_ns;
-    int64_t completion_deadline_ns, safety_deadline_ns;
+    int64_t completion_deadline_ns, safety_deadline_ns, trial_duration_ns;
     uint64_t last_ordered_bytes, phase_start, phase_end, trial_range_bytes;
     uint64_t batch_bytes, required_raw_bytes;
     int required_descriptors;
@@ -87,7 +87,7 @@ struct mp_curl_controller {
     double buffer_slope, last_buffer_seconds, trial_buffer_seconds;
     double previous_capacity, phase_buffer_seconds, candidate_buffer_gain;
     double baseline_buffer_slope, candidate_buffer_slope;
-    bool buffer_seen, experiment, consuming, recovery_adoption;
+    bool buffer_seen, experiment, consuming, recovery_adoption, trial_clock, baseline_comparable;
     struct mp_curl_profile active_profile, candidate_profile;
 };
 struct mp_curl_observation {

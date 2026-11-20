@@ -69,6 +69,7 @@
 #include "demux/avio_crypto.h"
 #include "demux/demux.h"
 #include "misc/bstr.h"
+#include "misc/ctype.h"
 #include "misc/dispatch.h"
 #include "misc/path_utils.h"
 #include "misc/thread_tools.h"
@@ -346,7 +347,6 @@ struct curl_ctx {
     bool playback_seeking;
     int64_t paused_ns;
     int64_t pause_started_ns;
-    int64_t buffer_generation;
 };
 
 struct priv;
@@ -472,6 +472,11 @@ struct priv {
     int64_t content_size; // -1 if unknown
     int64_t start_offset; // requested initial byte offset, immutable after open
     char *server_filename; // from Content-Disposition, NULL if absent
+    // Copied on the curl thread before the probe completes: the easy handle
+    // belongs to that thread, and the strings it returns live only as long as
+    // the transfer does.
+    char *probe_mime_type;
+    char *probe_effective_url;
 
     // Producer state. Only touched by the curl thread.
     uint64_t request_start;    // absolute byte position of next request
@@ -514,9 +519,6 @@ struct priv {
     int64_t phase_active_ns;
     bool ring_waiting; // curl-thread accounting, independent of resume commands
     bool startup;
-    uint64_t startup_start;
-    uint64_t startup_end;
-    int64_t startup_buffer_generation;
 
     // Probe state. Set on the curl thread read by curl_open after.
     bool probed;
@@ -1015,7 +1017,13 @@ static void end_measurement(struct curl_handle_ref *ref, bool succeeded)
                 ctx->ttfb_ms = p->ttfb_ms;
         }
         p->phase_completed++;
-    } else {
+    } else if (ref->generation == p->generation &&
+               !(succeeded && ref->blocked && !ref->foreign))
+    {
+        // Requests left over from before a phase change finish unmeasured;
+        // only this phase's own requests can disqualify it. One that waited
+        // for a full ring is not capacity evidence, but a full ring is what
+        // a settled stream looks like, not a reason to distrust the phase.
         p->phase_blocked = true;
     }
 }
@@ -1317,8 +1325,11 @@ static void run_cmd(void *arg)
                 int source = 0;
                 for (int n = 0; n < policy->num_samples; n++) {
                     const struct mp_curl_sample *sample = &policy->samples[n];
+                    // wall_ms has whole-second resolution, while the app stamps
+                    // samples in milliseconds: one written this second is not
+                    // from the future. Larger skews are.
                     if (sample->receive_profile || sample->requests < 1 || sample->requests > policy->max_requests ||
-                        sample->updated_ms > wall_ms || wall_ms - sample->updated_ms > INT64_C(2592000000) ||
+                        sample->updated_ms > wall_ms + 60000 || wall_ms - sample->updated_ms > INT64_C(2592000000) ||
                         sample->http_version == 30 || (sample->http_version == 0 && sample->source != 1))
                         continue;
                     if (source > sample->source)
@@ -1352,8 +1363,6 @@ static void run_cmd(void *arg)
         c->p->startup_ns = mp_time_ns();
         curl_multi_setopt(ctx->multi, CURLMOPT_MAXCONNECTS, 64L);
         curl_multi_setopt(ctx->multi, CURLMOPT_MAX_HOST_CONNECTIONS, 18L);
-        c->p->startup_start = c->p->request_start;
-        c->p->startup_buffer_generation = ctx->buffer_generation;
         ctx->stream_id = c->p->stream_id;
         ctx->selected_requests = c->p->selected_requests;
         // Seed only the summary; learned concurrency points require real data.
@@ -1451,9 +1460,6 @@ static void run_cmd(void *arg)
         // Keep rejection and capacity evidence across seek.
         c->p->startup = c->p->opts->fixed_requests == 0 &&
                          c->p->opts->max_request_size > 0;
-        c->p->startup_end = 0;
-        c->p->startup_start = c->pos;
-        c->p->startup_buffer_generation = ctx->buffer_generation;
         c->p->startup_ns = mp_time_ns();
         c->p->seek_probe = true;
         int best = mp_curl_controller_best(&c->p->controller, c->p->opts->parallel_requests);
@@ -2585,7 +2591,6 @@ static void apply_playback_state(struct curl_ctx *ctx)
     if (!fresh)
         return;
     ctx->state_updates++;
-    ctx->buffer_generation = ctx->state_updates;
     if (state.seeking != ctx->playback_seeking)
         ctx->pause_serial++; // a seek invalidates in-flight capacity evidence
     ctx->playback_seeking = state.seeking;
@@ -2739,52 +2744,58 @@ static int64_t parse_content_range_total(const char *value)
     return (rest.len == 0 && total > 0) ? (int64_t)total : -1;
 }
 
-static bool parse_exact_content_range(const char *value, uint64_t *start,
-                                      uint64_t *end, int64_t *total)
+// Unsigned decimal below INT64_MAX, so that an inclusive end can always be
+// made exclusive and compared with signed sizes.
+static bool eat_offset(bstr *s, uint64_t *out)
 {
-    unsigned long long first = 0;
-    unsigned long long last = 0;
-    long long size = 0;
-    char trailing = '\0';
-    if (!value ||
-        sscanf(value, "bytes %llu-%llu/%lld %c",
-               &first, &last, &size, &trailing) != 3 ||
-        last < first || size <= 0 || last >= (unsigned long long)size)
-    {
-        return false;
+    uint64_t v = 0;
+    int digits = 0;
+    while (digits < s->len && mp_isdigit(s->start[digits])) {
+        unsigned d = s->start[digits] - '0';
+        if (v > (INT64_MAX - 1 - d) / 10)
+            return false;
+        v = v * 10 + d;
+        digits++;
     }
-    *start = first;
-    *end = last + 1;
-    *total = size;
+    if (!digits)
+        return false;
+    *s = bstr_cut(*s, digits);
+    *out = v;
     return true;
 }
 
-// "bytes <start>-<end>/<total>" where <total> may be "*". end is exclusive;
+// "bytes <first>-<last>/<total>" where <total> may be "*". end is exclusive;
 // total is -1 when unknown.
 static bool parse_content_range(const char *value, uint64_t *start,
                                 uint64_t *end, int64_t *total)
 {
-    unsigned long long first = 0;
-    unsigned long long last = 0;
-    int consumed = 0;
-    if (!value ||
-        sscanf(value, "bytes %llu-%llu/%n", &first, &last, &consumed) != 2 ||
-        !consumed || last < first)
-    {
+    bstr s = bstr_strip(bstr0(value));
+    uint64_t first, last, size = 0;
+    bool unknown_size = false;
+    if (!bstr_eatstart0(&s, "bytes") || !s.len || s.start[0] != ' ')
+        return false;
+    s = bstr_lstrip(s);
+    if (!eat_offset(&s, &first) || !bstr_eatstart0(&s, "-") ||
+        !eat_offset(&s, &last) || !bstr_eatstart0(&s, "/"))
+        return false;
+    if (bstr_eatstart0(&s, "*")) {
+        unknown_size = true;
+    } else if (!eat_offset(&s, &size) || last >= size) {
         return false;
     }
-    bstr rest = bstr_strip(bstr0(value + consumed));
-    long long size = -1;
-    if (!bstr_equals0(rest, "*")) {
-        bstr tail;
-        size = bstrtoll(rest, &tail, 10);
-        if (!rest.len || tail.len || size < 0 || last >= (unsigned long long)size)
-            return false;
-    }
+    if (s.len || last < first)
+        return false;
     *start = first;
     *end = last + 1;
-    *total = size;
+    *total = unknown_size ? -1 : (int64_t)size;
     return true;
+}
+
+// As parse_content_range(), but the total size must be stated.
+static bool parse_exact_content_range(const char *value, uint64_t *start,
+                                      uint64_t *end, int64_t *total)
+{
+    return parse_content_range(value, start, end, total) && *total > 0;
 }
 
 // Extend the contiguous published prefix of the queue. Called with mtx held.
@@ -2883,22 +2894,12 @@ static const char *header_value(CURL *c, const char *name)
     return NULL;
 }
 
-static int64_t parse_content_range_start(CURL *c)
+// Byte offsets address the stored representation only when nothing encoded
+// it in transit. libcurl decodes what it is offered.
+static bool identity_encoding(CURL *c)
 {
-    const char *value = header_value(c, "Content-Range");
-    if (!value)
-        return -1;
-    bstr range;
-    if (!bstr_split_tok(bstr0(value), "/", &range, &(bstr){0}))
-        return -1;
-    bstr_eatstart0(&range, "bytes");
-    bstr start;
-    if (!bstr_split_tok(bstr_lstrip(range), "-", &start, &(bstr){0}))
-        return -1;
-    bstr rest;
-    long long value_start = bstrtoll(start, &rest, 10);
-    return start.len > 0 && rest.len == 0 && value_start >= 0
-        ? value_start : -1;
+    const char *ce = header_value(c, "Content-Encoding");
+    return !ce || !ce[0] || strcasecmp(ce, "identity") == 0;
 }
 
 
@@ -2937,7 +2938,8 @@ static size_t dynamic_header_callback(char *buffer, size_t size, size_t nitems,
         parse_exact_content_range(header_value(request->curl, "Content-Range"),
                             &start, &end, &total) &&
         start == first && end == range->end &&
-        total == p->content_size && same_entity;
+        total == p->content_size && same_entity &&
+        identity_encoding(request->curl);
     if (!valid) {
         MP_WARN(p, "parallel range %" PRIu64 "-%" PRIu64
                    " rejected (HTTP %ld)\n", first, range->end - 1, resp);
@@ -2948,11 +2950,17 @@ static size_t dynamic_header_callback(char *buffer, size_t size, size_t nitems,
 
 static void finalize_probe(struct priv *p)
 {
+    char *ctype = NULL;
+    const char *effective = NULL;
+    curl_easy_getinfo(p->curl, CURLINFO_CONTENT_TYPE, &ctype);
+    curl_easy_getinfo(p->curl, CURLINFO_EFFECTIVE_URL, &effective);
+    bstr mime = bstr_strip(bstr_split(bstr0(ctype), ";", NULL));
+    p->probe_mime_type = mime.len ? bstrto0(p, mime) : NULL;
+    p->probe_effective_url = talloc_strdup(p, effective);
+
     if (mp_msg_test(p->log, MSGL_DEBUG)) {
         long resp = 0;
-        char *ctype = NULL;
         curl_easy_getinfo(p->curl, CURLINFO_RESPONSE_CODE, &resp);
-        curl_easy_getinfo(p->curl, CURLINFO_CONTENT_TYPE, &ctype);
         MP_DBG(p, "proto=%.*s ok=%d code=%ld size=%" PRId64 " seekable=%d type=%s\n",
                BSTR_P(p->scheme->scheme), p->stream_ok, resp,
                p->content_size, p->seekable, ctype ? ctype : "-");
@@ -3005,10 +3013,15 @@ static void probe_http(struct priv *p, struct bstr line)
     }
     p->reply_ranged = resp == 206;
 
-    int64_t response_start = parse_content_range_start(p->curl);
-
-    // A request with an explicit start offset must be honored by the server
-    if (p->start_offset > 0 && response_start != p->start_offset) {
+    // A request with an explicit start offset must be honored by the server,
+    // and any partial reply must start where it was asked to: its bytes go to
+    // the reader at the requested offset.
+    uint64_t response_start = 0;
+    bool range_ok = resp == 206 &&
+        parse_content_range(header_value(p->curl, "Content-Range"),
+                            &response_start, &(uint64_t){0}, &(int64_t){0}) &&
+        response_start == (uint64_t)p->start_offset;
+    if ((resp == 206 || p->start_offset > 0) && !range_ok) {
         MP_ERR(p, "Server ignored range request at offset %" PRId64 "\n",
                p->start_offset);
         goto done;
@@ -3016,8 +3029,7 @@ static void probe_http(struct priv *p, struct bstr line)
 
     // Compressed responses are byte-addressed in the encoded representation,
     // which our caller can't translate, so they are non-seekable.
-    const char *ce = header_value(p->curl, "Content-Encoding");
-    bool compressed = ce && ce[0] && strcasecmp(ce, "identity") != 0;
+    bool compressed = !identity_encoding(p->curl);
     const char *ar = header_value(p->curl, "Accept-Ranges");
     bool accept_ranges = ar && strcasecmp(ar, "bytes") == 0;
 
@@ -3137,7 +3149,7 @@ static void validate_http_response(struct priv *p, struct bstr line)
     bool valid =
         same_entity && is_http_success(resp) &&
         (!p->seekable ||
-         (resp == 206 &&
+         (resp == 206 && identity_encoding(p->curl) &&
           parse_content_range(range, &start, &end, &total) &&
           start == p->request_start &&
           (!p->primary_end || end <= p->primary_end) &&
@@ -3184,19 +3196,89 @@ static size_t header_callback(char *buffer, size_t size, size_t nitems, void *us
     return bytes;
 }
 
+// Headers whose values carry no credentials or request targets. Everything
+// else is logged by name only: providers authenticate with headers of their
+// own naming, and URLs carry tokens in their queries.
+static bool header_value_loggable(bstr name)
+{
+    static const char *const names[] = {
+        "accept", "accept-encoding", "accept-ranges", "age", "alt-svc",
+        "cache-control", "connection", "content-encoding", "content-length",
+        "content-range", "content-type", "date", "etag", "keep-alive",
+        "last-modified", "range", "retry-after", "server", "transfer-encoding",
+        "vary",
+    };
+    for (int n = 0; n < MP_ARRAY_SIZE(names); n++) {
+        if (bstrcasecmp0(name, names[n]) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void trace_header_line(struct priv *p, const char *prefix, bstr line,
+                              bool request_line)
+{
+    if (!line.len)
+        return;
+    if (request_line) {
+        // "GET /path?query HTTP/1.1": keep the method and the version.
+        bstr method = bstr_split(line, " ", &line);
+        int version = bstrrchr(line, ' ');
+        bstr proto = version >= 0 ? bstr_cut(line, version + 1) : (bstr){0};
+        MP_TRACE(p, "%s%.*s <target> %.*s\n", prefix, BSTR_P(method), BSTR_P(proto));
+        return;
+    }
+    int colon = bstrchr(line, ':');
+    if (colon < 0) {
+        // A status line, which carries only the protocol and the code.
+        MP_TRACE(p, "%s%.*s\n", prefix, BSTR_P(line));
+        return;
+    }
+    bstr name = bstr_splice(line, 0, colon);
+    if (header_value_loggable(name)) {
+        MP_TRACE(p, "%s%.*s\n", prefix, BSTR_P(line));
+    } else {
+        MP_TRACE(p, "%s%.*s: <redacted>\n", prefix, BSTR_P(name));
+    }
+}
+
 static int debug_callback(CURL *handle, curl_infotype type, char *data, size_t size,
                           void *userdata)
 {
     struct priv *p = userdata;
-    const char *prefix;
+    if (!mp_msg_test(p->log, MSGL_TRACE))
+        return 0;
+    bstr msg = (bstr){data, size};
     switch (type) {
-    case CURLINFO_TEXT:       prefix = "* "; break;
-    case CURLINFO_HEADER_IN:  prefix = "< "; break;
-    case CURLINFO_HEADER_OUT: prefix = "> "; break;
-    default:                  return 0;
+    case CURLINFO_TEXT: {
+        // libcurl's own notes quote redirect targets in full.
+        bstr text = bstr_strip_linebreaks(msg);
+        int url = bstr_find0(text, "://");
+        if (url >= 0) {
+            while (url > 0 && text.start[url - 1] != ' ' && text.start[url - 1] != '\'')
+                url--;
+            MP_TRACE(p, "* %.*s<url>\n", url, text.start);
+        } else {
+            MP_TRACE(p, "* %.*s\n", BSTR_P(text));
+        }
+        break;
     }
-    bstr msg = bstr_strip_linebreaks((bstr){data, size});
-    MP_TRACE(p, "%s%.*s\n", prefix, BSTR_P(msg));
+    case CURLINFO_HEADER_IN:
+        trace_header_line(p, "< ", bstr_strip_linebreaks(msg), false);
+        break;
+    case CURLINFO_HEADER_OUT: {
+        // libcurl hands over the whole request header block at once.
+        bool first = true;
+        while (msg.len) {
+            bstr line = bstr_strip_linebreaks(bstr_getline(msg, &msg));
+            trace_header_line(p, "> ", line, first);
+            first = false;
+        }
+        break;
+    }
+    default:
+        break;
+    }
     return 0;
 }
 
@@ -3379,6 +3461,10 @@ static struct mp_curl_observation stream_observation(struct priv *p, int64_t now
     o.consumer_wanted = p->consumer_waiting || (!ctx->playback_state.idle && !ctx->playback_state.eof);
     o.prefix_incomplete = p->range_count && !p->ranges[p->range_head].complete;
     o.reorder_growing = stream_reorder(p) > 0;
+    // Bytes waiting in the ring are playback the reader has not reached yet:
+    // with a small demuxer cache they are most of what is buffered.
+    if (o.buffer_valid && ctx->media_bitrate > 0)
+        o.buffer_seconds += stream_readable(p) * 8.0 / ctx->media_bitrate;
     if (p->hol_started_ns)
         o.hol_ratio += MP_TIME_NS_TO_S(now - p->hol_started_ns) / wall;
     mp_mutex_unlock(&p->mtx);
@@ -3406,7 +3492,10 @@ static struct mp_curl_observation stream_observation(struct priv *p, int64_t now
         o.phase_start = p->control_start;
         o.phase_bytes = p->ordered_pos > p->control_start
             ? MPMIN(p->ordered_pos, p->control_end) - p->control_start : 0;
-        o.phase_seconds = p->control_started_ns ? MP_TIME_NS_TO_S(now - p->control_started_ns) : 0;
+        // Capacity over the time requests were actually transferring: a
+        // phase that waits on a full ring measures the consumer otherwise.
+        o.phase_seconds = p->control_started_ns
+            ? MPMIN(MP_TIME_NS_TO_S(now - p->control_started_ns), MP_TIME_NS_TO_S(p->phase_active_ns)) : 0;
         o.phase_short = p->control_end > dynamic_limit(p);
     }
     return o;
@@ -3703,7 +3792,11 @@ static void fill_dynamic(struct priv *p)
         p->grant_seen = p->ctx->budget.desired_extra;
         p->udp_limited = false;
         select_stream_pool(p);
-        memset(&p->controller, 0, sizeof(p->controller));
+        // A new pool ends any trial, but evidence stays: what no longer
+        // matches the socket shape is already ignored by its profile.
+        struct mp_curl_controller fresh = {0};
+        memcpy(fresh.counts, p->controller.counts, sizeof(fresh.counts));
+        p->controller = fresh;
         reset_phase(p, mp_time_ns());
     }
     if (p->startup) {
@@ -4699,16 +4792,9 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
     if (!p->stream_ok || atomic_load(&p->aborted))
         return STREAM_ERROR;
 
-    char *content_type = NULL;
-    curl_easy_getinfo(p->curl, CURLINFO_CONTENT_TYPE, &content_type);
-    bstr mime = bstr_strip(bstr_split(bstr0(content_type), ";", NULL));
-    if (mime.len)
-        s->mime_type = bstrto0(s, mime);
+    s->mime_type = talloc_strdup(s, p->probe_mime_type);
     s->server_filename = talloc_strdup(s, p->server_filename);
-
-    const char *effective_url = NULL;
-    curl_easy_getinfo(p->curl, CURLINFO_EFFECTIVE_URL, &effective_url);
-    s->effective_url = talloc_strdup(s, effective_url);
+    s->effective_url = talloc_strdup(s, p->probe_effective_url);
 
     s->seekable = p->seekable;
     s->is_network = true;

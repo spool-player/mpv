@@ -73,6 +73,17 @@ int mp_curl_controller_best(const struct mp_curl_controller *c, int maximum)
 
 static void retire(struct mp_curl_controller *c, int reason)
 {
+    // Only a completed comparison earns the full pause before the next one;
+    // a disturbed trial may be retried after eight seconds.
+    if (c->experiment && (reason == MP_CURL_REASON_INCONCLUSIVE || reason == MP_CURL_REASON_DEADLINE)) {
+        c->last_trial_ns = c->last_now_ns - 22 * SECOND;
+        // A downward trial that could not finish is not retried on the same
+        // path either: each attempt starves an already waiting consumer.
+        if (c->candidate && c->candidate < c->baseline) {
+            c->counts[c->candidate - 1].rejected_ns = c->last_now_ns;
+            c->counts[c->candidate - 1].rejected_capacity = c->previous_capacity;
+        }
+    }
     if (c->experiment) {
         c->target_requests = c->baseline;
         c->state = MP_CURL_RETIRING;
@@ -96,9 +107,10 @@ static bool current_epoch(struct mp_curl_controller *c, const struct mp_curl_obs
     if (c->profile_generation && o->profile_generation != c->profile_generation) {
         struct mp_curl_profile expected = c->active_profile;
         expected.range_bytes = c->trial_range_bytes;
+        // A new transfer shape ends the experiment, not what was learned:
+        // evidence is matched against the shape whenever it is used.
         if (!c->experiment || !same_shape(&expected, &o->profile)) {
             retire(c, MP_CURL_REASON_INCONCLUSIVE);
-            memset(c->counts, 0, sizeof(c->counts));
             c->stable_since_ns = 0;
         }
     }
@@ -148,7 +160,17 @@ void mp_curl_controller_tick(struct mp_curl_controller *c, const struct mp_curl_
     if (!buffer && !o->playable_progress && !o->paused
         && (o->now_ns - c->started_ns >= SECOND || o->ordered_bytes >= 512 * 1024))
         c->urgency = fmax(c->urgency, .7);
-    double prefix_seconds = fmax(1, 2 * fmax(0, o->rtt_ms) / 1000 + fmax(0, o->ttfb_ms) / 1000);
+    // The head range is stalled once it has taken longer than fetching it
+    // afresh would: a new request's round trips plus one range at the
+    // current per-lane rate, with half again for jitter. A flat timeout
+    // would keep cancelling healthy ranges on every slow path.
+    // A new phase has no capacity of its own yet; the count's evidence does.
+    int lanes = o->requests < 1 ? 1 : o->requests > 16 ? 16 : o->requests;
+    double rate = c->counts[lanes - 1].capacity > 0 ? c->counts[lanes - 1].capacity : o->capacity;
+    double lane_rate = isfinite(rate) && rate > 0 ? rate / lanes : 0;
+    double range_seconds = lane_rate > 0 ? o->profile.range_bytes / lane_rate : 0;
+    double prefix_seconds = fmax(1, 2 * fmax(0, o->rtt_ms) / 1000 + fmax(0, o->ttfb_ms) / 1000
+                                        + 1.5 * range_seconds);
     bool stalled = o->prefix_incomplete && !o->blocked && !o->paused
         && o->now_ns - c->prefix_progress_ns >= prefix_seconds * SECOND;
     if (stalled)
@@ -182,10 +204,19 @@ void mp_curl_controller_tick(struct mp_curl_controller *c, const struct mp_curl_
             c->state = MP_CURL_PAUSED;
             c->urgency = 0;
         }
+    } else if (c->experiment && !c->trial_clock && isfinite(o->phase_seconds) && o->phase_seconds > 0) {
+        // The trial's ranges queue behind those already in flight. Its time
+        // runs from its first measured byte, not from the decision.
+        c->trial_clock = true;
+        c->completion_deadline_ns = o->now_ns - (int64_t)(o->phase_seconds * SECOND) + c->trial_duration_ns;
     } else if (c->experiment
         && ((c->completion_deadline_ns && o->now_ns > c->completion_deadline_ns)
             || (c->safety_deadline_ns && o->now_ns > c->safety_deadline_ns)
-            || (buffer && c->trial_buffer_seconds - o->buffer_seconds > 2 - c->urgency) || o->underrun)) {
+            || (buffer && c->trial_buffer_seconds - o->buffer_seconds > 2 - c->urgency)
+            // An underrun ends a trial that had buffer to lose. A consumer that
+            // was already starving underruns throughout the very trial that
+            // may get it out.
+            || (o->underrun && c->trial_buffer_seconds >= 1))) {
         retire(c, MP_CURL_REASON_DEADLINE);
     }
     if (stalled) {
@@ -248,15 +279,29 @@ static bool shape(struct mp_curl_controller *c, const struct mp_curl_observation
     // reserve one lane set plus a leading safety descriptor, not every range
     // in all three batches. Full-cache comparisons retain all six lane sets.
     int descriptors = consuming ? k + 1 : 6 * k;
-    if (o->free_descriptors < descriptors) {
+    // While playback drains the queue its descriptors are recycled into the
+    // trial as they free, so none need be free when it is decided.
+    bool recycled = consuming && !o->paused && !o->eof && o->buffer_valid;
+    if (!recycled && o->free_descriptors < descriptors) {
         c->reason = MP_CURL_REASON_DESCRIPTORS;
         return false;
     }
     uint64_t cap = o->batch_cap ? o->batch_cap : (o->constrained ? 8 : 32) * MIB;
     uint64_t limit = minimum(
         o->range_limit ? o->range_limit : 16 * MIB, o->profile.range_bytes ? o->profile.range_bytes : 512 * 1024);
-    uint64_t smallest = power_floor(minimum(256 * 1024, limit));
+    uint64_t smallest = power_floor(minimum(consuming ? 64 * 1024 : 256 * 1024, limit));
     uint64_t range = power_floor(minimum(limit, minimum(cap / (2 * k), o->free_raw_bytes / ((consuming ? 4 : 6) * k))));
+    // A trial while playback is waiting must finish within its deadline, so
+    // its batches shrink with the path: about a second each at the measured
+    // capacity, never below the smallest useful range.
+    if (consuming && isfinite(o->capacity) && o->capacity > 0) {
+        uint64_t units = 1;
+        while (units < (uint64_t)(2 * k))
+            units *= 2;
+        uint64_t paced = power_floor((uint64_t)(o->capacity / units));
+        if (paced < range)
+            range = paced < smallest ? smallest : paced;
+    }
     if (!range || range < smallest) {
         c->reason = MP_CURL_REASON_RAW_MEMORY;
         return false;
@@ -355,8 +400,12 @@ int mp_curl_controller_decide(struct mp_curl_controller *c, const struct mp_curl
             phase(c, MP_CURL_BASELINE_AFTER, c->baseline);
             return c->baseline;
         }
-        double reference = (c->baseline_capacity + capacity) / 2;
+        // The first baseline drains whatever the stream had in flight. When
+        // that was cut to another range size, only the second one compares.
+        double reference = c->baseline_comparable ? (c->baseline_capacity + capacity) / 2 : capacity;
         double spread = reference > 0 ? fabs(c->baseline_capacity - capacity) / reference : INFINITY;
+        if (!c->baseline_comparable)
+            spread = reference > 0 ? 0 : INFINITY;
         double margin = fmax(.15, 2 * spread);
         bool fewer = c->candidate < c->baseline;
         bool adequate = o->demand_bps > 0 && c->candidate_capacity >= 1.75 * o->demand_bps / 8;
@@ -366,15 +415,26 @@ int mp_curl_controller_decide(struct mp_curl_controller *c, const struct mp_curl
         // every upward step just because several steps are needed to catch up.
         bool deficit_improved = c->candidate_capacity > reference * (1 + margin)
             && c->candidate_buffer_slope > (c->baseline_buffer_slope + after_slope) / 2 + .01;
+        // Fewer requests at no loss of capacity cannot have cost the consumer
+        // anything, whatever an already empty buffer did meanwhile.
         bool recovered = !c->consuming || !o->consumer_wanted || c->trial_buffer_seconds >= 8
-            || c->candidate_buffer_gain > 0 || deficit_improved;
+            || c->candidate_buffer_gain > 0 || deficit_improved
+            || (fewer && c->candidate_capacity >= reference * .95);
+        // Fewer requests are cheaper for both ends. They are kept when they
+        // still carry the media with headroom, or, short of that, when they
+        // lose no more than noise.
         bool accepted = spread <= .15 && recovered
             && (c->candidate_capacity >= reference * (1 + margin)
-                || (fewer && c->candidate_capacity >= reference * .9
-                    && (adequate || c->candidate_capacity >= reference)));
+                || (fewer && (adequate || c->candidate_capacity >= reference * .95)));
         int candidate = c->candidate;
         if (spread > .15) {
             retire(c, MP_CURL_REASON_INCONCLUSIVE);
+            // An unsettled path is no reason to keep starving playback with
+            // the same downward trial; wait for it to change, as on rejection.
+            if (fewer) {
+                c->counts[candidate - 1].rejected_ns = o->now_ns;
+                c->counts[candidate - 1].rejected_capacity = reference;
+            }
         } else {
             retire(c, accepted ? MP_CURL_REASON_ACCEPTED : MP_CURL_REASON_REJECTED);
             c->target_requests = accepted ? candidate : c->baseline;
@@ -387,10 +447,15 @@ int mp_curl_controller_decide(struct mp_curl_controller *c, const struct mp_curl
             trial.profile = c->candidate_profile;
             trial.capacity = c->candidate_capacity;
             record(c, &trial);
-            if (!accepted) {
-                struct mp_curl_count_evidence *e = &c->counts[candidate - 1];
+            // The count that lost is not tried again until the path changes:
+            // a rejected candidate, or the count a downshift moved away from.
+            // A downshift also rules out the counts it skipped.
+            int first = accepted ? (fewer ? candidate + 1 : 0) : candidate;
+            int last = accepted ? (fewer ? c->baseline : 0) : candidate;
+            for (int n = first; n && n <= last; n++) {
+                struct mp_curl_count_evidence *e = &c->counts[n - 1];
                 e->rejected_ns = o->now_ns;
-                e->rejected_capacity = reference;
+                e->rejected_capacity = accepted ? c->candidate_capacity : reference;
             }
         }
         c->last_trial_ns = o->now_ns;
@@ -420,14 +485,29 @@ int mp_curl_controller_decide(struct mp_curl_controller *c, const struct mp_curl
     int reason = MP_CURL_REASON_NONE;
     bool pressure = (o->hol_ratio > .2 && o->reorder_growing)
         || (o->worker_cpu_available && o->worker_cpu >= .85 && previous > 0 && o->capacity < previous * .95);
+    bool short_of_demand = recovery && o->demand_bps > 0 && o->capacity < 1.75 * o->demand_bps / 8;
+    bool more = short_of_demand && o->network_wait_available
+        && o->network_wait_ratio >= .5 && o->storage_ratio < .05 && o->hol_ratio < .1
+        && (!o->worker_cpu_available || o->worker_cpu < .7) && selected < o->max_requests
+        && !rejected(&c->counts[selected], o);
+    // Short of demand with no useful step up, a learned count must still be
+    // able to decay: on a contended or serialising origin fewer requests do
+    // as well or better. Two seconds between trials let a descent finish
+    // within a short playback; rejected counts stay rejected.
+    bool fewer = short_of_demand && selected > 1 && !rejected(&c->counts[selected / 2 - 1], o)
+        && (!c->last_trial_ns || o->now_ns - c->last_trial_ns >= 2 * SECOND);
     if (pressure && selected > 1) {
         candidate--;
         reason = o->hol_ratio > .2 ? MP_CURL_REASON_HOL : MP_CURL_REASON_CPU;
         recovery = true;
-    } else if (recovery && o->demand_bps > 0 && o->capacity < 1.75 * o->demand_bps / 8 && o->network_wait_available
-        && o->network_wait_ratio >= .5 && o->storage_ratio < .05 && o->hol_ratio < .1
-        && (!o->worker_cpu_available || o->worker_cpu < .7) && selected < o->max_requests) {
+    } else if (more) {
         candidate++;
+        reason = MP_CURL_REASON_DEMAND;
+    } else if (fewer) {
+        // Halve rather than step: a starving consumer cannot wait out one
+        // trial per request. A rejected half is then retried no sooner than
+        // any other rejected count.
+        candidate = selected / 2;
         reason = MP_CURL_REASON_DEMAND;
     } else if (o->explore && c->stable_since_ns && o->now_ns - c->stable_since_ns >= 8 * SECOND
         && (!c->last_trial_ns || o->now_ns - c->last_trial_ns >= 30 * SECOND)) {
@@ -439,12 +519,16 @@ int mp_curl_controller_decide(struct mp_curl_controller *c, const struct mp_curl
     }
     if (candidate == selected || rejected(&c->counts[candidate - 1], o))
         return selected;
-    if (!shape(c, o, candidate, recovery)) {
+    // A trial while playback runs drains with the consumer, which is what a
+    // full ring of buffered ranges needs: its descriptors free as it plays.
+    bool playing = !o->paused && !o->eof && o->buffer_valid;
+    if (!shape(c, o, candidate, recovery || playing)) {
         c->action = MP_CURL_DEFER;
         return selected;
     }
     c->baseline = selected;
     c->candidate = candidate;
+    c->baseline_comparable = o->profile.range_bytes == c->trial_range_bytes;
     c->experiment = true;
     c->recovery_adoption = false;
     c->reason = reason;
@@ -452,9 +536,25 @@ int mp_curl_controller_decide(struct mp_curl_controller *c, const struct mp_curl
     c->trial_buffer_seconds = o->buffer_seconds;
     c->phase_buffer_seconds = o->buffer_seconds;
     c->candidate_buffer_gain = 0;
-    double deadline = clamp(2 * 3 * c->batch_bytes / fmax(o->capacity, 1), 2, 8);
-    c->completion_deadline_ns = o->now_ns + (int64_t)(deadline * SECOND);
-    double safety = isfinite(c->runway_seconds) ? fmax(.25, fmin(deadline, c->runway_seconds / 2)) : deadline;
+    // Twice the expected time of three batches. A trial while playback waits
+    // already has nothing buffered to protect, so a slow path gets longer.
+    // The ranges already in flight ahead of the trial count as well: its
+    // first phase cannot complete before they do.
+    double queued = (double)o->requests * o->profile.range_bytes;
+    // With a full buffer the phases advance only as playback consumes them.
+    double pace = fmax(o->capacity, 1);
+    if (!recovery && o->demand_bps > 0)
+        pace = fmin(pace, o->demand_bps / 8);
+    double deadline = clamp(2 * (3 * c->batch_bytes + queued) / pace, 2, recovery ? 16 : 30);
+    // Until its first phase starts, the trial may wait out one more deadline
+    // for the requests already in flight to drain.
+    c->trial_duration_ns = (int64_t)(deadline * SECOND);
+    c->trial_clock = false;
+    c->completion_deadline_ns = o->now_ns + 2 * c->trial_duration_ns;
+    // The safety deadline protects buffered playback. With nothing buffered
+    // there is no runway left to spend, and a trial is the way out.
+    double safety = isfinite(c->runway_seconds) && o->buffer_seconds >= 1
+        ? fmax(.25, fmin(deadline, c->runway_seconds / 2)) : deadline;
     c->safety_deadline_ns = o->now_ns + (int64_t)(safety * SECOND);
     c->last_trial_ns = o->now_ns;
     phase(c, MP_CURL_BASELINE_BEFORE, selected);

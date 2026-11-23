@@ -2649,9 +2649,7 @@ Property list
     Libcurl transport diagnostics as a node map. Available when the curl backend
     is initialized. No URLs, request headers or server identifiers are exposed.
 
-    ``received-bytes``, ``average-received-bytes-per-second``,
-    ``current-received-bytes-per-second``, ``peak-received-bytes-per-second``,
-    ``elapsed-seconds``
+    ``received-bytes``, ``average-received-bytes-per-second``, ``current-received-bytes-per-second``, ``peak-received-bytes-per-second``, ``elapsed-seconds``
         Traffic counters retained for this mpv core's lifetime, including seeks
         and stream reopens. Received bytes are validated response-body chunks
         observed by curl's write callbacks, including actual retransfers after
@@ -2666,8 +2664,7 @@ Property list
         Peak is the largest such full window, never a short-window average;
         it remains zero until a full second has elapsed. All rates are bytes/s.
 
-    ``ordered-available-bytes``, ``consumer-delivered-bytes``,
-    ``readable-bytes``, ``retained-bytes``, ``reorder-bytes``
+    ``ordered-available-bytes``, ``consumer-delivered-bytes``, ``readable-bytes``, ``retained-bytes``, ``reorder-bytes``
         Lifetime publication and consumer-copy totals, followed by current
         queue gauges. Ordered bytes count newly validated contiguous prefixes,
         not later retained ranges or retry overlap. Seeks/refetches can publish
@@ -2676,8 +2673,7 @@ Property list
         reserved capacity; readable bytes exclude a queue behind the primary
         request. Reorder bytes are retained beyond the first queue gap.
 
-    ``copy-in-bytes``, ``copy-out-bytes``, ``reorder-copy-bytes``,
-    ``body-callbacks``, ``worker-iterations``, ``coalesced-wakeups``
+    ``copy-in-bytes``, ``copy-out-bytes``, ``reorder-copy-bytes``, ``body-callbacks``, ``worker-iterations``, ``coalesced-wakeups``
         Lifetime instrumentation of transport-owned copies and work. Copy-in
         counts actual ring/queue writes (not ICY metadata or retry comparisons),
         copy-out counts delivery to the reader. The ordered queue has no
@@ -2732,9 +2728,7 @@ Property list
         windows, empty windows and failed CPU queries are unavailable: a shared
         worker cannot precisely attribute CPU to individual streams.
 
-    ``active-requests``, ``peak-active-requests``, ``active-streams``,
-    ``peak-active-streams``, ``started-requests``, ``finished-requests``,
-    ``failed-requests``, ``retry-attempts``
+    ``active-requests``, ``peak-active-requests``, ``active-streams``, ``peak-active-streams``, ``started-requests``, ``finished-requests``, ``failed-requests``, ``retry-attempts``
         Current activity and core-lifetime request counters. Removed/cancelled
         handles need not produce a request-completion event.
 
@@ -2761,8 +2755,7 @@ Property list
         since the previous read of this property, and for the core's lifetime.
         It is CPU scheduling delay, not network latency.
 
-    ``scheduling-lateness-p50-ms``, ``scheduling-lateness-p99-ms``,
-    ``scheduling-lateness-available``
+    ``scheduling-lateness-p50-ms``, ``scheduling-lateness-p99-ms``, ``scheduling-lateness-available``
         Percentile upper bounds from the last completed one-second deadline
         window. Only polls which reach their deadline contribute; early socket
         wakeups are not late samples. A fixed power-of-two microsecond
@@ -2788,8 +2781,7 @@ Property list
         ``kern.ipc.maxsockbuf`` and ``net.inet.tcp.autorcvbufmax``), and
         whether the CPU has AES instructions (1, 0, or -1 unknown).
 
-    ``playback-state-updates``, ``playback-buffer-seconds``,
-    ``playback-demand-bits-per-second``, ``playback-user-paused``
+    ``playback-state-updates``, ``playback-buffer-seconds``, ``playback-demand-bits-per-second``, ``playback-user-paused``
         Playback state the player reports to the transport every 250 ms while
         a curl stream is open, including while the cache is full. Demand is the
         larger of the demuxer's measured audio plus video bitrate (scaled by

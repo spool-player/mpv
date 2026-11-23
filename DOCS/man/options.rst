@@ -3008,6 +3008,7 @@ Subtitles
     .. note::
 
         Never applied to text subtitles.
+
 ``--sub-sdf-softness=<0.5-2.0>``
     Set the anti-aliasing ramp width used when reconstructing image subtitles
     with the signed-distance scaler (default: 1.0). Values below 1.0 produce a
@@ -3019,20 +3020,14 @@ Subtitles
     subtitles (default: yes). Shadow dimensions use destination pixels, so the
     result stays visually constant as the subtitle or window is resized.
 
-``--sub-sdf-shadow-core-sigma=<0.1-4.0>``
-``--sub-sdf-shadow-core-grow=<0.0-4.0>``
-``--sub-sdf-shadow-core-opacity=<0.0-1.0>``
+``--sub-sdf-shadow-core-sigma=<0.1-4.0>``, ``--sub-sdf-shadow-core-grow=<0.0-4.0>``, ``--sub-sdf-shadow-core-opacity=<0.0-1.0>``
     Configure the tight edge-protection layer's Gaussian softness, outward
     growth, and opacity (defaults: 1.0, 1.0, and 0.7).
 
 ``--sub-sdf-shadow-spread=<yes|no>``
     Enable the wide contrast layer (default: yes).
 
-``--sub-sdf-shadow-spread-sigma=<1.0-16.0>``
-``--sub-sdf-shadow-spread-grow=<0.0-8.0>``
-``--sub-sdf-shadow-spread-x=<-16.0-16.0>``
-``--sub-sdf-shadow-spread-y=<-16.0-16.0>``
-``--sub-sdf-shadow-spread-opacity=<0.0-1.0>``
+``--sub-sdf-shadow-spread-sigma=<1.0-16.0>``, ``--sub-sdf-shadow-spread-grow=<0.0-8.0>``, ``--sub-sdf-shadow-spread-x=<-16.0-16.0>``, ``--sub-sdf-shadow-spread-y=<-16.0-16.0>``, ``--sub-sdf-shadow-spread-opacity=<0.0-1.0>``
     Configure the wide layer's Gaussian softness, outward growth, horizontal
     and vertical offset, and opacity (defaults: 6.0, 0.0, 2.0, 3.0, and 0.3).
     All dimensions use destination pixels.

@@ -49,6 +49,7 @@
 #include "video/out/gpu/video.h"
 #include "wayland_common.h"
 
+#if HAVE_WAYLAND_PROTOCOLS_1_41
 static struct wl_event_queue *create_named_event_queue(
     struct wl_display *display, const char *name)
 {
@@ -59,6 +60,8 @@ static struct wl_event_queue *create_named_event_queue(
     return wl_display_create_queue(display);
 #endif
 }
+
+#endif
 
 void vo_wayland_surface_damage(struct vo_wayland_state *wl,
                                struct wl_surface *surface,
@@ -107,6 +110,9 @@ void vo_wayland_surface_damage(struct vo_wayland_state *wl,
 #include "xdg-session-management-v1.h"
 #define HAVE_XDG_SESSION_MANAGEMENT 1
 #endif
+#endif
+#ifndef HAVE_XDG_SESSION_MANAGEMENT
+#define HAVE_XDG_SESSION_MANAGEMENT 0
 #endif
 
 #ifndef CLOCK_MONOTONIC_RAW

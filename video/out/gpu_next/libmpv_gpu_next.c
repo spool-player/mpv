@@ -57,7 +57,9 @@
 // and a backend that cannot be compiled is not one that can be offered.
 #if defined(PL_HAVE_D3D11) && __has_include(<d3d11.h>)
 #define MP_LIBMPV_D3D11 1
+#ifndef COBJMACROS
 #define COBJMACROS
+#endif
 #include <d3d11.h>
 #include <libplacebo/d3d11.h>
 #include "mpv/render_d3d11.h"

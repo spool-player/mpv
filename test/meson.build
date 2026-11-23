@@ -140,6 +140,7 @@ test('sub-sdf-scale', sub_sdf_scale)
 
 sub_ass_color = executable('sub-ass-color', files('sub_ass_color.c'),
                            include_directories: incdir,
+                           dependencies: libass,
                            objects: libmpv.extract_objects('sub/sub_ass_color.c'),
                            link_with: test_utils)
 test('sub-ass-color', sub_ass_color)
@@ -217,9 +218,21 @@ if get_option('libmpv')
                          include_directories: incdir_public)
         test('libmpv-lifetime', exe, depends: mpvlib, suite: 'libmpv')
         if features['libcurl']
+            transport_env = environment()
+            if host_machine.system() == 'linux' and get_option('b_sanitize').split(',').contains('address')
+                # Python loads libmpv with ctypes. Preload the compiler's ASan
+                # runtime so it initializes before Python and the shared library.
+                arch = host_machine.cpu_family() == 'x86' ? 'i386' : host_machine.cpu_family()
+                runtime = cc.get_id() == 'gcc' ? 'libasan.so' : 'libclang_rt.asan-' + arch + '.so'
+                asan = run_command(cc.cmd_array(), '-print-file-name=' + runtime, check: true).stdout().strip()
+                if not import('fs').is_file(asan)
+                    error('ASan runtime for curl-transport not found: ' + asan)
+                endif
+                transport_env.prepend('LD_PRELOAD', asan, separator: ':')
+            endif
             test('curl-transport', python,
                  args: [files('curl_transport.py'), '--libmpv', mpvlib.full_path()],
-                 depends: mpvlib, suite: 'libmpv', timeout: 180)
+                 depends: mpvlib, env: transport_env, suite: 'libmpv', timeout: 600)
         endif
     endif
 endif

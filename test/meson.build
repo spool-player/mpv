@@ -217,7 +217,8 @@ if get_option('libmpv')
         exe = executable('libmpv-lifetime', sources: 'libmpv_lifetime.c',
                          include_directories: incdir_public)
         test('libmpv-lifetime', exe, depends: mpvlib, suite: 'libmpv')
-        if features['libcurl']
+        # The Python process must use the same ABI as the built libmpv.
+        if features['libcurl'] and not meson.is_cross_build()
             transport_env = environment()
             if host_machine.system() == 'linux' and get_option('b_sanitize').split(',').contains('address')
                 # Python loads libmpv with ctypes. Preload the compiler's ASan

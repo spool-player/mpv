@@ -147,14 +147,14 @@
 
     <request name="attach_punchthrough">
       <description summary="attach punchthrough">
-        Requests a punch-through on the exporetd window associated with
+        Requests a punch-through on the exported window associated with
         this import object.
       </description>
     </request>
 
     <request name="detach_punchthrough">
       <description summary="detach punchthrough">
-        Requests to detatch the punch-through from the exported window
+        Requests to detach the punch-through from the exported window
         associated with this import object.
       </description>
     </request>
@@ -185,7 +185,7 @@
 
     <request name="attach_punchthrough_with_context" since="2">
       <description summary="attach punchthrough with context id">
-        Requests a punch-through on the exporetd window associated with
+        Requests a punch-through on the exported window associated with
         this import object for a given context id.
       </description>
       <arg name="context_id" type="string" summary="context id for requesting to external entity"/>

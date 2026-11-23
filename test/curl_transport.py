@@ -9,7 +9,7 @@ The fixture is the real HTTP boundary. It does not mock scheduling or metrics.
 import argparse
 import array
 import contextlib
-import ctypes as C
+import ctypes
 import hashlib
 import http.server
 import json
@@ -25,33 +25,34 @@ import threading
 import time
 import unittest
 import urllib.parse
+from typing import Any
 
 
-class Node(C.Structure):
+class Node(ctypes.Structure):
     pass
 
 
-class NodeList(C.Structure):
-    _fields_ = [("num", C.c_int), ("values", C.POINTER(Node)),
-                ("keys", C.POINTER(C.c_char_p))]
+class NodeList(ctypes.Structure):
+    _fields_ = [("num", ctypes.c_int), ("values", ctypes.POINTER(Node)),
+                ("keys", ctypes.POINTER(ctypes.c_char_p))]
 
 
-class NodeValue(C.Union):
-    _fields_ = [("string", C.c_char_p), ("flag", C.c_int),
-                ("int64", C.c_int64), ("double", C.c_double),
-                ("list", C.POINTER(NodeList)), ("pointer", C.c_void_p)]
+class NodeValue(ctypes.Union):
+    _fields_ = [("string", ctypes.c_char_p), ("flag", ctypes.c_int),
+                ("int64", ctypes.c_int64), ("double", ctypes.c_double),
+                ("list", ctypes.POINTER(NodeList)), ("pointer", ctypes.c_void_p)]
 
 
-Node._fields_ = [("u", NodeValue), ("format", C.c_int)]
+Node._fields_ = [("u", NodeValue), ("format", ctypes.c_int)]
 
 
-class Event(C.Structure):
-    _fields_ = [("id", C.c_int), ("error", C.c_int),
-                ("userdata", C.c_uint64), ("data", C.c_void_p)]
+class Event(ctypes.Structure):
+    _fields_ = [("id", ctypes.c_int), ("error", ctypes.c_int),
+                ("userdata", ctypes.c_uint64), ("data", ctypes.c_void_p)]
 
 
-class EndFile(C.Structure):
-    _fields_ = [("reason", C.c_int), ("error", C.c_int)]
+class EndFile(ctypes.Structure):
+    _fields_ = [("reason", ctypes.c_int), ("error", ctypes.c_int)]
 
 
 def decode(node):
@@ -66,7 +67,11 @@ def decode(node):
     if node.format in (7, 8):
         values = node.u.list.contents
         result = [decode(values.values[i]) for i in range(values.num)]
-        return dict(zip((values.keys[i].decode() for i in range(values.num)), result)) if node.format == 8 else result
+        return (
+            dict(zip((values.keys[i].decode() for i in range(values.num)), result))
+            if node.format == 8
+            else result
+        )
     return None
 
 
@@ -86,13 +91,13 @@ def encode(value, keep):
         values = (Node * len(value))(*(encode(v, keep) for v in value))
         entries = NodeList(len(value), values, None)
         keep.extend((values, entries))
-        node.format, node.u.list = 7, C.pointer(entries)
+        node.format, node.u.list = 7, ctypes.pointer(entries)
     elif isinstance(value, dict):
         values = (Node * len(value))(*(encode(v, keep) for v in value.values()))
-        keys = (C.c_char_p * len(value))(*(k.encode() for k in value))
+        keys = (ctypes.c_char_p * len(value))(*(k.encode() for k in value))
         entries = NodeList(len(value), values, keys)
         keep.extend((values, keys, entries))
-        node.format, node.u.list = 8, C.pointer(entries)
+        node.format, node.u.list = 8, ctypes.pointer(entries)
     else:
         raise TypeError(value)
     return node
@@ -104,18 +109,30 @@ class Player:
         self.delivery_bitrate = float(options.pop("delivery_bitrate", 0))
         self.prior_ttfb_ms = float(options.pop("prior_ttfb_ms", 0))
         self.maximum_requests = int(options.get("curl-parallel-requests", 4))
-        self.lib = C.CDLL(library)
-        self.lib.mpv_create.restype = C.c_void_p
+        self.lib = ctypes.CDLL(library)
+        self.lib.mpv_create.restype = ctypes.c_void_p
         signatures = {
-            "mpv_set_option_string": ([C.c_void_p, C.c_char_p, C.c_char_p], C.c_int),
-            "mpv_initialize": ([C.c_void_p], C.c_int),
-            "mpv_command": ([C.c_void_p, C.POINTER(C.c_char_p)], C.c_int),
-            "mpv_get_property": ([C.c_void_p, C.c_char_p, C.c_int, C.c_void_p], C.c_int),
-            "mpv_set_property": ([C.c_void_p, C.c_char_p, C.c_int, C.c_void_p], C.c_int),
-            "mpv_set_property_string": ([C.c_void_p, C.c_char_p, C.c_char_p], C.c_int),
-            "mpv_free_node_contents": ([C.POINTER(Node)], None),
-            "mpv_wait_event": ([C.c_void_p, C.c_double], C.POINTER(Event)),
-            "mpv_terminate_destroy": ([C.c_void_p], None),
+            "mpv_set_option_string": (
+                [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p],
+                ctypes.c_int,
+            ),
+            "mpv_initialize": ([ctypes.c_void_p], ctypes.c_int),
+            "mpv_command": ([ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p)], ctypes.c_int),
+            "mpv_get_property": (
+                [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p],
+                ctypes.c_int,
+            ),
+            "mpv_set_property": (
+                [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p],
+                ctypes.c_int,
+            ),
+            "mpv_set_property_string": (
+                [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p],
+                ctypes.c_int,
+            ),
+            "mpv_free_node_contents": ([ctypes.POINTER(Node)], None),
+            "mpv_wait_event": ([ctypes.c_void_p, ctypes.c_double], ctypes.POINTER(Event)),
+            "mpv_terminate_destroy": ([ctypes.c_void_p], None),
         }
         for name, (args, result) in signatures.items():
             fn = getattr(self.lib, name)
@@ -131,7 +148,10 @@ class Player:
         defaults.update(options)
         try:
             for key, value in defaults.items():
-                self.check(self.lib.mpv_set_option_string(self.handle, key.encode(), str(value).encode()), key)
+                self.check(
+                    self.lib.mpv_set_option_string(self.handle, key.encode(), str(value).encode()),
+                    key,
+                )
             self.check(self.lib.mpv_initialize(self.handle), "initialize")
         except BaseException:
             self.close()
@@ -148,31 +168,43 @@ class Player:
             self.handle = None
 
     def command(self, *args):
-        encoded = (C.c_char_p * (len(args) + 1))(*(str(arg).encode() for arg in args), None)
+        encoded = (ctypes.c_char_p * (len(args) + 1))(*(str(arg).encode() for arg in args), None)
         self.check(self.lib.mpv_command(self.handle, encoded), args[0])
 
     def get(self, name):
         node = Node()
-        if self.lib.mpv_get_property(self.handle, name.encode(), 6, C.byref(node)) < 0:
+        if self.lib.mpv_get_property(self.handle, name.encode(), 6, ctypes.byref(node)) < 0:
             return None
         try:
             return decode(node)
         finally:
-            self.lib.mpv_free_node_contents(C.byref(node))
+            self.lib.mpv_free_node_contents(ctypes.byref(node))
 
     def set(self, name, value):
-        self.check(self.lib.mpv_set_property_string(self.handle, name.encode(), str(value).encode()), name)
+        self.check(
+            self.lib.mpv_set_property_string(self.handle, name.encode(), str(value).encode()), name,
+        )
 
     def transport_control(self, values):
         # Returns libmpv's result: tests assert rejections as well as success.
-        keep = []
+        keep: list[object] = []
         node = encode(values, keep)
-        return self.lib.mpv_set_property(self.handle, b"curl-transport-control", 6, C.byref(node))
+        return self.lib.mpv_set_property(
+            self.handle, b"curl-transport-control", 6, ctypes.byref(node),
+        )
 
     def configure(self, epoch, **facts):
-        self.check(self.transport_control({"format": 2, "op": 0, "playback-epoch": epoch,
-                                           **{key.replace("_", "-"): value for key, value in facts.items()}}),
-                   "configure")
+        self.check(
+            self.transport_control(
+                {
+                    "format": 2,
+                    "op": 0,
+                    "playback-epoch": epoch,
+                    **{key.replace("_", "-"): value for key, value in facts.items()},
+                },
+            ),
+            "configure",
+        )
 
     def play(self, url, loaded=None, timeout=90):
         if self.initial_requests or self.delivery_bitrate:
@@ -212,9 +244,11 @@ class Player:
             if event.id == 7:
                 if not was_loaded:
                     raise AssertionError("transport failed before file-loaded")
-                end = C.cast(event.data, C.POINTER(EndFile)).contents
+                end = ctypes.cast(event.data, ctypes.POINTER(EndFile)).contents
                 if end.reason != 0:
-                    raise AssertionError(f"playback did not reach EOF: reason={end.reason}, error={end.error}")
+                    raise AssertionError(
+                        f"playback did not reach EOF: reason={end.reason}, error={end.error}",
+                    )
                 return {"seconds": time.monotonic() - started, "started": started,
                         "first-progress-seconds": first_progress,
                         "samples": samples, "positions": positions,
@@ -240,10 +274,24 @@ class Origin:
             frames.byteswap()
         pcm = frames.tobytes()
         self.pcm = pcm
-        self.payload = (b"RIFF" + struct.pack("<I", len(pcm) + 36) + b"WAVEfmt " +
-                        struct.pack("<IHHIIHH", 16, 1, wav[0], wav[1], wav[0] * wav[1] * wav[2] // 8,
-                                    wav[0] * wav[2] // 8, wav[2]) +
-                        b"data" + struct.pack("<I", len(pcm)) + pcm)
+        self.payload = (
+            b"RIFF"
+            + struct.pack("<I", len(pcm) + 36)
+            + b"WAVEfmt "
+            + struct.pack(
+                "<IHHIIHH",
+                16,
+                1,
+                wav[0],
+                wav[1],
+                wav[0] * wav[1] * wav[2] // 8,
+                wav[0] * wav[2] // 8,
+                wav[2],
+            )
+            + b"data"
+            + struct.pack("<I", len(pcm))
+            + pcm
+        )
         self.latency, self.per_lane, self.shared = latency, per_lane, shared
         self.serialized, self.reorder, self.fault = serialized, reorder, fault
         self.cap, self.unknown_size = cap, unknown_size
@@ -254,7 +302,7 @@ class Origin:
         self.fault_after = fault_after  # first request start eligible for the fault
         self.fault_start = fault_start  # or only a request starting exactly here
         self.replaced = False
-        self.resumed = []  # per TLS request: did the handshake resume a session
+        self.resumed: list[bool] = []  # per TLS request: did the handshake resume a session
         self.fault_range = None
         self.pause_started = threading.Event()
         self.pause_window = None
@@ -262,8 +310,8 @@ class Origin:
         self.lock = threading.Lock()
         self.disk = threading.Lock()
         self.next_shared = 0
-        self.requests = []
-        self.if_ranges = []
+        self.requests: list[tuple[int, int]] = []
+        self.if_ranges: list[str | None] = []
         self.faulted = False
         origin = self
 
@@ -276,7 +324,10 @@ class Origin:
             def do_GET(self):
                 match = re.fullmatch(r"bytes=(\d+)-(\d*)", self.headers.get("Range", ""))
                 start = int(match[1]) if match else 0
-                end = min(int(match[2]) + 1 if match and match[2] else len(origin.payload), len(origin.payload))
+                end = min(
+                    int(match[2]) + 1 if match and match[2] else len(origin.payload),
+                    len(origin.payload),
+                )
                 if start >= end:
                     self.send_response(416)
                     total = "*" if origin.unknown_size else len(origin.payload)
@@ -289,8 +340,12 @@ class Origin:
                 with origin.lock:
                     if origin.tls:
                         origin.resumed.append(self.connection.session_reused)
-                    inject = bool(origin.fault and not origin.faulted and start >= origin.fault_after
-                                  and origin.fault_start in (None, start))
+                    inject = bool(
+                        origin.fault
+                        and not origin.faulted
+                        and start >= origin.fault_after
+                        and origin.fault_start in (None, start),
+                    )
                     origin.faulted |= inject
                     if inject:
                         origin.fault_range = (start, end)
@@ -343,7 +398,9 @@ class Origin:
                             if origin.shared:
                                 with origin.lock:
                                     deadline_shared = max(time.monotonic(), origin.next_shared)
-                                    origin.next_shared = deadline_shared + len(block) / origin.shared
+                                    origin.next_shared = (
+                                        deadline_shared + len(block) / origin.shared
+                                    )
                                 time.sleep(max(0, deadline_shared - time.monotonic()))
                             if origin.per_lane:
                                 with origin.lock:
@@ -353,7 +410,9 @@ class Origin:
                                 deadline += len(block) * penalty / origin.per_lane
                                 time.sleep(max(0, deadline - time.monotonic()))
                             chunked = unterminated or overlong
-                            self.wfile.write(b"%x\r\n%s\r\n" % (len(block), block) if chunked else block)
+                            self.wfile.write(
+                                b"%x\r\n%s\r\n" % (len(block), block) if chunked else block,
+                            )
                             self.wfile.flush()
                         if overlong:
                             self.wfile.write(b"0\r\n\r\n")
@@ -426,11 +485,18 @@ class CurlTransport(unittest.TestCase):
                 wall_rate = metrics["received-bytes"] / result["seconds"]
                 self.assertLessEqual(metrics["average-received-bytes-per-second"], wall_rate * 1.2)
                 self.assertGreater(metrics["average-received-bytes-per-second"], wall_rate * 0.8)
-                self.assertEqual(sum(lane["received-bytes"] for lane in metrics["lane-samples"]), metrics["received-bytes"])
+                self.assertEqual(
+                    sum(lane["received-bytes"] for lane in metrics["lane-samples"]),
+                    metrics["received-bytes"],
+                )
                 self.assertGreater(metrics["consumer-delivered-bytes"], len(origin.pcm))
                 self.assertEqual(metrics["copy-out-bytes"], metrics["consumer-delivered-bytes"])
-                self.assertGreaterEqual(metrics["ordered-available-bytes"], metrics["consumer-delivered-bytes"])
-                self.assertGreaterEqual(metrics["received-bytes"], metrics["ordered-available-bytes"])
+                self.assertGreaterEqual(
+                    metrics["ordered-available-bytes"], metrics["consumer-delivered-bytes"],
+                )
+                self.assertGreaterEqual(
+                    metrics["received-bytes"], metrics["ordered-available-bytes"],
+                )
                 self.assertEqual(metrics["copy-in-bytes"], metrics["ordered-available-bytes"])
                 self.assertEqual(metrics["reorder-copy-bytes"], 0)
                 self.assertGreater(metrics["body-callbacks"], 0)
@@ -449,7 +515,9 @@ class CurlTransport(unittest.TestCase):
                     self.assertAlmostEqual(lane["average-bytes-per-second"], expected, delta=2)
             finally:
                 player.close()
-            self.assertEqual(hashlib.sha256(output.read_bytes()).digest(), hashlib.sha256(origin.pcm).digest())
+            self.assertEqual(
+                hashlib.sha256(output.read_bytes()).digest(), hashlib.sha256(origin.pcm).digest(),
+            )
 
     def test_pause_seek_reopen_lifetime(self):
         with Origin(size=3 << 20, latency=0.02) as origin:
@@ -468,7 +536,9 @@ class CurlTransport(unittest.TestCase):
                 self.assertEqual(idle["current-received-bytes-per-second"], 0)
                 self.assertTrue(idle["scheduling-lateness-available"])
                 self.assertGreaterEqual(idle["scheduling-lateness-p50-ms"], 0)
-                self.assertGreaterEqual(idle["scheduling-lateness-p99-ms"], idle["scheduling-lateness-p50-ms"])
+                self.assertGreaterEqual(
+                    idle["scheduling-lateness-p99-ms"], idle["scheduling-lateness-p50-ms"],
+                )
                 self.assertGreater(idle["ring-wait-seconds"] -
                                    settled["ring-wait-seconds"], 1)
                 self.assertGreater(idle["curl-thread-wall-seconds"],
@@ -490,17 +560,30 @@ class CurlTransport(unittest.TestCase):
                 second = player.play(origin.url)["metrics"]
                 self.assertGreater(second["received-bytes"], first["received-bytes"])
                 self.assertGreater(second["stream-id"], first["stream-id"])
-                for key in ("curl-thread-wall-seconds", "ring-wait-seconds",
-                            "consumer-wait-seconds", "consumer-delivered-bytes", "ordered-available-bytes",
-                            "copy-in-bytes", "copy-out-bytes", "body-callbacks", "consumer-thread-cpu-seconds"):
+                for key in (
+                    "curl-thread-wall-seconds",
+                    "ring-wait-seconds",
+                    "consumer-wait-seconds",
+                    "consumer-delivered-bytes",
+                    "ordered-available-bytes",
+                    "copy-in-bytes",
+                    "copy-out-bytes",
+                    "body-callbacks",
+                    "consumer-thread-cpu-seconds",
+                ):
                     self.assertGreaterEqual(second[key], first[key])
             finally:
                 player.close()
 
     def test_invalid_and_truncated_ranges_preserve_pcm(self):
         for fault in ("range", "truncate", "unavailable"):
-            with self.subTest(fault=fault), Origin(size=2 << 20, fault=fault,
-                    etag='"v1"' if fault == "unavailable" else None) as origin, tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(fault=fault),
+                Origin(
+                    size=2 << 20, fault=fault, etag='"v1"' if fault == "unavailable" else None,
+                ) as origin,
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 output = pathlib.Path(directory) / "actual.pcm"
                 player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
                                            "ao-pcm-waveheader": "no", "audio-format": "s16",
@@ -536,10 +619,14 @@ class CurlTransport(unittest.TestCase):
             # retained: that wait is head-of-line blocking, nothing else.
             metrics = result["metrics"]
             self.assertGreater(metrics["head-of-line-seconds"], 1.0)
-            self.assertLess(metrics["head-of-line-seconds"], metrics["consumer-wait-seconds"] + 0.01)
+            self.assertLess(
+                metrics["head-of-line-seconds"], metrics["consumer-wait-seconds"] + 0.01,
+            )
             self.assertGreater(metrics["peak-reorder-bytes"], mib)
             self.assertGreater(metrics["head-of-line-events"], 0)
-            self.assertGreaterEqual(metrics["reorder-wait-seconds"], metrics["head-of-line-seconds"])
+            self.assertGreaterEqual(
+                metrics["reorder-wait-seconds"], metrics["head-of-line-seconds"],
+            )
             gaps = [sample for at, sample in result["samples"]
                     if paused + 1.0 <= result["started"] + at <= resumed - 0.2
                     and sample["reorder-bytes"] > 0]
@@ -547,7 +634,9 @@ class CurlTransport(unittest.TestCase):
             self.assertGreater(gaps[-1]["oldest-gap-seconds"], gaps[0]["oldest-gap-seconds"])
             self.assertGreater(gaps[-1]["reorder-wait-seconds"], gaps[0]["reorder-wait-seconds"])
             for sample in gaps:
-                self.assertGreaterEqual(sample["retained-bytes"], sample["readable-bytes"] + sample["reorder-bytes"])
+                self.assertGreaterEqual(
+                    sample["retained-bytes"], sample["readable-bytes"] + sample["reorder-bytes"],
+                )
                 self.assertFalse(sample["snapshot-truncated"])
                 self.assertTrue(sample["streams"])
                 self.assertLessEqual(sum(row["active-requests"] for row in sample["connections"]),
@@ -568,8 +657,12 @@ class CurlTransport(unittest.TestCase):
         mib = 1 << 20
         # Beyond lavf's initial format probe: playback, not probing, is now
         # requesting this prefix. Lifetime counters include probe re-reads.
-        with Origin(size=10 << 20, latency=0.01, per_lane=4 << 20,
-                    pause=(7 * mib + mib // 2, 3.0)) as origin, tempfile.TemporaryDirectory() as directory:
+        with (
+            Origin(
+                size=10 << 20, latency=0.01, per_lane=4 << 20, pause=(7 * mib + mib // 2, 3.0),
+            ) as origin,
+            tempfile.TemporaryDirectory() as directory,
+        ):
             output = pathlib.Path(directory) / "actual.pcm"
             player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
                                        "ao-pcm-waveheader": "no", "audio-format": "s16",
@@ -594,12 +687,29 @@ class CurlTransport(unittest.TestCase):
         # retained: the queue is torn down mid-flight, and everything played
         # after the seek must be exactly the file from the seek target on.
         mib = 1 << 20
-        with Origin(size=6 << 20, latency=0.01, per_lane=4 << 20, etag='"v1"',
-                    pause=(mib + mib // 2, 3.0)) as origin, tempfile.TemporaryDirectory() as directory:
+        with (
+            Origin(
+                size=6 << 20,
+                latency=0.01,
+                per_lane=4 << 20,
+                etag='"v1"',
+                pause=(mib + mib // 2, 3.0),
+            ) as origin,
+            tempfile.TemporaryDirectory() as directory,
+        ):
             output = pathlib.Path(directory) / "actual.pcm"
-            player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output, "ao-pcm-waveheader": "no",
-                                       "audio-format": "s16", "curl-fixed-requests": "4",
-                                       "curl-max-request-size": "1MiB", "curl-buffer-size": "8MiB"})
+            player = Player(
+                LIBRARY,
+                **{
+                    "ao": "pcm",
+                    "ao-pcm-file": output,
+                    "ao-pcm-waveheader": "no",
+                    "audio-format": "s16",
+                    "curl-fixed-requests": "4",
+                    "curl-max-request-size": "1MiB",
+                    "curl-buffer-size": "8MiB",
+                },
+            )
             target = 2.0
 
             def seek_during_pause():
@@ -641,7 +751,9 @@ class CurlTransport(unittest.TestCase):
                 if etag:
                     self.assertIn(middle, starts)
                     self.assertEqual(starts.count(start), 1)
-                    retried = next(index for index, (first, _) in enumerate(origin.requests) if first == middle)
+                    retried = next(
+                        index for index, (first, _) in enumerate(origin.requests) if first == middle
+                    )
                     self.assertEqual(origin.if_ranges[retried], etag)
                 else:
                     self.assertNotIn(middle, starts)
@@ -654,12 +766,17 @@ class CurlTransport(unittest.TestCase):
         # request an empty range for a descriptor playback may already have
         # read and reused (parallel range). Both faults follow lavf's seek
         # back to the WAV data at byte 44, so playback reads what follows.
-        for name, fault in (("primary", {"fault_start": 44}), ("parallel range", {"fault_after": 3 << 20})):
+        for name, fault in (
+            ("primary", {"fault_start": 44}),
+            ("parallel range", {"fault_after": 3 << 20}),
+        ):
             # Long enough that playback is still reading when the faulted
             # connection finally drops.
-            with self.subTest(request=name), Origin(size=12 << 20, fault="unterminated", etag='"v1"',
-                                                    **fault) as origin, \
-                    tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(request=name),
+                Origin(size=12 << 20, fault="unterminated", etag='"v1"', **fault) as origin,
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 output = pathlib.Path(directory) / "actual.pcm"
                 player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
                                            "ao-pcm-waveheader": "no", "audio-format": "s16",
@@ -696,7 +813,10 @@ class CurlTransport(unittest.TestCase):
     def test_range_reply_longer_than_its_range_is_rejected(self):
         # A chunked 206 has no Content-Length to stop it. Bytes past the end
         # of the range belong to later offsets and must never be played here.
-        for name, fault in (("primary", {"fault_start": 44}), ("parallel range", {"fault_after": 3 << 20})):
+        for name, fault in (
+            ("primary", {"fault_start": 44}),
+            ("parallel range", {"fault_after": 3 << 20}),
+        ):
             with self.subTest(request=name), Origin(size=6 << 20, fault="overlong", etag='"v1"',
                                                     **fault) as origin, \
                     tempfile.TemporaryDirectory() as directory:
@@ -740,7 +860,7 @@ class CurlTransport(unittest.TestCase):
         # while the cache is full and the ordinary cache timer is idle.
         with Origin(size=4 << 20, latency=0.01) as origin:
             player = Player(LIBRARY, **{"pause": "yes", "ao-null-untimed": "no"})
-            observed = {}
+            observed: dict[str, Any] = {}
 
             def paused_then_play(current):
                 time.sleep(0.5)
@@ -757,7 +877,9 @@ class CurlTransport(unittest.TestCase):
                 player.close()
             before, after = observed["paused"]
             self.assertTrue(after["playback-user-paused"])
-            self.assertGreaterEqual(after["playback-state-updates"] - before["playback-state-updates"], 4)
+            self.assertGreaterEqual(
+                after["playback-state-updates"] - before["playback-state-updates"], 4,
+            )
             playing = [metrics for at, metrics in result["samples"]
                        if result["started"] + at >= observed["resumed-at"] + 2]
             self.assertTrue(playing)
@@ -770,7 +892,11 @@ class CurlTransport(unittest.TestCase):
         # This owns the real socket contract, including Linux's doubled
         # accounting. User-space curl buffer settings cannot make it pass.
         for mode in ("os-auto", "measured", "fixed"):
-            with self.subTest(mode=mode), Origin(size=4 << 20, latency=.04) as origin, tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(mode=mode),
+                Origin(size=4 << 20, latency=0.04) as origin,
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 output = pathlib.Path(directory) / "receive-window.pcm"
                 player = Player(LIBRARY, **{"curl-fixed-requests": "4",
                     "curl-receive-mode": mode, "curl-receive-bytes": "4MiB",
@@ -795,7 +921,9 @@ class CurlTransport(unittest.TestCase):
                     effective = row["receive-effective-bytes"]
                     self.assertGreater(effective, 0)
                     if mode == "fixed":
-                        accounted = effective // 2 if sys.platform.startswith("linux") else effective
+                        accounted = (
+                            effective // 2 if sys.platform.startswith("linux") else effective
+                        )
                         self.assertEqual(row["receive-status"], 1 if accounted >= requested else 2)
                     else:
                         self.assertEqual(row["receive-status"], 0)
@@ -807,15 +935,22 @@ class CurlTransport(unittest.TestCase):
             player.configure(1, max_requests=3, fixed_requests=2,
                 explore=False, http_mode=2, receive_mode=2, receive_bytes=4 << 20,
                 primary_origin="https://example.invalid:443", transport_samples=[])
-            for bad in ({"max-requests": 0}, {"max-requests": 17},
-                        {"max-requests": 2, "fixed-requests": 3},
-                        {"receive-mode": 3}, {"receive-bytes": 1024},
-                        {"receive-bytes": 17 << 20}, {"http-mode": 4},
-                        {"explore": 1}, {"primary-origin": "https://example.invalid/media"},
-                        {"primary-origin": "https://user:password@example.invalid"},
-                        {"transport-samples": [{}]},
-                        {"transport-samples": [0]},
-                        {"joint-extra-grant-bytes": 1}):
+            invalid_controls: tuple[dict[str, object], ...] = (
+                {"max-requests": 0},
+                {"max-requests": 17},
+                {"max-requests": 2, "fixed-requests": 3},
+                {"receive-mode": 3},
+                {"receive-bytes": 1024},
+                {"receive-bytes": 17 << 20},
+                {"http-mode": 4},
+                {"explore": 1},
+                {"primary-origin": "https://example.invalid/media"},
+                {"primary-origin": "https://user:password@example.invalid"},
+                {"transport-samples": [{}]},
+                {"transport-samples": [0]},
+                {"joint-extra-grant-bytes": 1},
+            )
+            for bad in invalid_controls:
                 with self.subTest(fields=tuple(bad)):
                     self.assertLess(player.transport_control(
                         {"format": 2, "op": 0, "playback-epoch": 2, **bad}), 0)
@@ -855,7 +990,9 @@ class CurlTransport(unittest.TestCase):
         autotune = int(pathlib.Path("/proc/sys/net/ipv4/tcp_rmem").read_text().split()[2])
         self.assertEqual(metrics["host-rmem-max-bytes"], rmem_max)
         self.assertEqual(metrics["host-receive-autotune-max-bytes"], autotune)
-        flags = re.search(r"^(?:flags|Features)\s*:(.*)$", pathlib.Path("/proc/cpuinfo").read_text(), re.M)
+        flags = re.search(
+            r"^(?:flags|Features)\s*:(.*)$", pathlib.Path("/proc/cpuinfo").read_text(), re.M,
+        )
         if flags:
             self.assertEqual(metrics["hw-aes"], int("aes" in flags[1].split()))
 
@@ -864,7 +1001,7 @@ class CurlTransport(unittest.TestCase):
         # or malformed controls change nothing. Background host traffic makes
         # capacity evidence invalid while it lasts.
         with Origin(size=8 << 20, latency=0.02, per_lane=256 << 10) as origin:
-            player = Player(LIBRARY, **{"ao-null-untimed": "no", "initial_requests": "4",})
+            player = Player(LIBRARY, **{"ao-null-untimed": "no", "initial_requests": "4"})
             checks = {}
 
             def control(current):
@@ -915,10 +1052,30 @@ class CurlTransport(unittest.TestCase):
             self.skipTest("openssl is required to create a test certificate")
         with tempfile.TemporaryDirectory() as directory:
             tls = pathlib.Path(directory)
-            subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt",
-                            "ec_paramgen_curve:P-256", "-nodes", "-days", "1", "-subj", "/CN=127.0.0.1",
-                            "-addext", "subjectAltName=IP:127.0.0.1", "-keyout", tls / "key.pem",
-                            "-out", tls / "cert.pem"], check=True, capture_output=True)
+            subprocess.run(
+                [
+                    "openssl",
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "ec",
+                    "-pkeyopt",
+                    "ec_paramgen_curve:P-256",
+                    "-nodes",
+                    "-days",
+                    "1",
+                    "-subj",
+                    "/CN=127.0.0.1",
+                    "-addext",
+                    "subjectAltName=IP:127.0.0.1",
+                    "-keyout",
+                    tls / "key.pem",
+                    "-out",
+                    tls / "cert.pem",
+                ],
+                check=True,
+                capture_output=True,
+            )
             options = {"tls-ca-file": tls / "cert.pem", "tls-verify": "yes",
                        "curl-fixed-requests": "1", "curl-parallel-requests": "1"}
             with Origin(size=1 << 20, tls=tls) as origin:
@@ -953,13 +1110,21 @@ class CurlTransport(unittest.TestCase):
                     player.close()
                 actual = output.read_bytes()
             if actual != origin.pcm:
-                first = next((n for n, (left, right) in enumerate(zip(actual, origin.pcm)) if left != right),
-                             min(len(actual), len(origin.pcm)))
-                self.fail(f"PCM coverage differs at {first}; actual={len(actual)}, expected={len(origin.pcm)}, "
-                          f"requests={origin.requests[:20]}")
+                first = next(
+                    (n for n, (left, right) in enumerate(zip(actual, origin.pcm)) if left != right),
+                    min(len(actual), len(origin.pcm)),
+                )
+                self.fail(
+                    f"PCM coverage differs at {first}; actual={len(actual)}, "
+                    f"expected={len(origin.pcm)}, "
+                    f"requests={origin.requests[:20]}",
+                )
 
     def test_stalled_transfer_is_retried_after_network_timeout(self):
-        with Origin(size=2 << 20, fault="stall") as origin, tempfile.TemporaryDirectory() as directory:
+        with (
+            Origin(size=2 << 20, fault="stall") as origin,
+            tempfile.TemporaryDirectory() as directory,
+        ):
             output = pathlib.Path(directory) / "actual.pcm"
             player = Player(LIBRARY, **{"ao": "pcm", "ao-pcm-file": output,
                                        "ao-pcm-waveheader": "no", "audio-format": "s16",
@@ -973,7 +1138,16 @@ class CurlTransport(unittest.TestCase):
 
     def test_adapts_per_lane_limit_and_reverts_serialization(self):
         for serialized in (False, True):
-            with self.subTest(serialized=serialized), Origin(size=24 << 20, latency=0.08, per_lane=1 << 20, serialized=serialized, wav=HEAVY_WAV) as origin:
+            with (
+                self.subTest(serialized=serialized),
+                Origin(
+                    size=24 << 20,
+                    latency=0.08,
+                    per_lane=1 << 20,
+                    serialized=serialized,
+                    wav=HEAVY_WAV,
+                ) as origin,
+            ):
                 player = Player(LIBRARY, **{"delivery_bitrate": "48000000"})
                 try:
                     result = player.play(origin.url)
@@ -986,7 +1160,9 @@ class CurlTransport(unittest.TestCase):
                     # nothing from it, so requests are shed and the smaller
                     # count is measured by the downward trial.
                     selected = result["metrics"]["selected-requests"]
-                    points = {point["requests"] for point in result["metrics"]["concurrency-samples"]}
+                    points = {
+                        point["requests"] for point in result["metrics"]["concurrency-samples"]
+                    }
                     if serialized:
                         self.assertLess(selected, 4)
                         self.assertIn(selected, points)
@@ -1032,7 +1208,7 @@ class CurlTransport(unittest.TestCase):
                 self.assertIn(2, points)
                 self.assertGreater(points[2], points[1] * 1.15)
                 self.assertLess(points[2], 48000000 * 1.75 / 8)
-                transitions = []
+                transitions: list[tuple[float, int]] = []
                 for elapsed, sample in result["samples"]:
                     choice = sample["selected-requests"]
                     if not transitions or choice != transitions[-1][1]:
@@ -1087,13 +1263,23 @@ def benchmark(library):
                 try:
                     result = player.play(origin.url)
                     metrics = result["metrics"]
-                    print(json.dumps({"scenario": name, "initial-lanes": lanes,
-                                      "seconds": result["seconds"],
-                                      "first-progress-seconds": result["first-progress-seconds"],
-                                      "selected-requests": metrics["selected-requests"],
-                                      "received-bytes": metrics["received-bytes"],
-                                      "average-bytes-per-second": metrics["average-received-bytes-per-second"],
-                                      "concurrency-samples": metrics["concurrency-samples"]}), flush=True)
+                    print(
+                        json.dumps(
+                            {
+                                "scenario": name,
+                                "initial-lanes": lanes,
+                                "seconds": result["seconds"],
+                                "first-progress-seconds": result["first-progress-seconds"],
+                                "selected-requests": metrics["selected-requests"],
+                                "received-bytes": metrics["received-bytes"],
+                                "average-bytes-per-second": metrics[
+                                    "average-received-bytes-per-second"
+                                ],
+                                "concurrency-samples": metrics["concurrency-samples"],
+                            },
+                        ),
+                        flush=True,
+                    )
                 finally:
                     player.close()
 

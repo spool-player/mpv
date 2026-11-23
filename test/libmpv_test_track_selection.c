@@ -534,6 +534,8 @@ int main(int argc, char *argv[])
 
     command_string("quit");
     while (wrap_wait_event()->event_id != MPV_EVENT_SHUTDOWN) {}
+    // Join libmpv's workers before process-wide dependency cleanup begins.
+    exit_cleanup();
 
     return 0;
 }

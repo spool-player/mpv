@@ -92,6 +92,8 @@ int main(void)
 
             set_option_string(ctx, "msg-level", "all=trace");
             set_option_string(ctx, "terminal", "yes");
+            check_error(set_option_string(ctx, "vo", "null"));
+            check_error(set_option_string(ctx, "ao", "null"));
 
             check_error(initialize(ctx));
 

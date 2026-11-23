@@ -147,6 +147,7 @@ test('sub-ass-color', sub_ass_color)
 
 sub_image_geometry = executable('sub-image-geometry', files('sub_image_geometry.c'),
                                 include_directories: incdir,
+                                dependencies: libplacebo,
                                 objects: libmpv.extract_objects(
                                     'sub/sub_image_geometry.c',
                                     'sub/sub_image_segmentation.c'),

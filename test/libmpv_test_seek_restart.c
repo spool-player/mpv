@@ -9,8 +9,9 @@
 
 static void wait_for_restart(void)
 {
-    for (int attempts = 0; attempts < 50; attempts++) {
-        mpv_event *event = mpv_wait_event(ctx, 0.1);
+    const int64_t deadline = mpv_get_time_ns(ctx) + INT64_C(5000000000);
+    for (int64_t now = mpv_get_time_ns(ctx); now < deadline; now = mpv_get_time_ns(ctx)) {
+        mpv_event *event = mpv_wait_event(ctx, (deadline - now) / 1e9);
         if (event->event_id == MPV_EVENT_PLAYBACK_RESTART)
             return;
         if (event->event_id == MPV_EVENT_END_FILE)

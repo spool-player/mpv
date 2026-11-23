@@ -174,11 +174,12 @@ libjxl_threads_dep = libjxl_proj.dependency('jxl_threads')
 meson.override_dependency('libjxl_threads', libjxl_threads_dep)
 "@
 
+$aomVersion = "3.13.3"
 if (-not (Test-Path "$subprojects/aom")) {
     New-Item -Path "$subprojects/aom" -ItemType Directory | Out-Null
 }
 Set-Content -Path "$subprojects/aom/meson.build" -Value @"
-project('aom', 'cpp', version: '3.13.1')
+project('aom', 'cpp', version: '$aomVersion')
 cmake = import('cmake')
 opts = cmake.subproject_options()
 opts.add_cmake_defines({
@@ -293,7 +294,7 @@ $projects = @(
     @{
         Path = "$subprojects/aom-cmake.wrap"
         URL = "https://aomedia.googlesource.com/aom"
-        Revision = "main"
+        Revision = "v$aomVersion"
     }
 )
 

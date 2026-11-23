@@ -316,6 +316,8 @@ clone-recursive = true
     Set-Content -Path $project.Path -Value $content
 }
 
+# The standalone Windows build uses HarfBuzz's bundled Unicode tables. Keep
+# optional GLib integration and GObject bindings out of the forced fallbacks.
 meson setup build `
     --wrap-mode=forcefallback `
     -Ddefault_library=static `
@@ -332,6 +334,8 @@ meson setup build `
     -Dffmpeg:libjxl=enabled `
     -Dffmpeg:libaom=enabled `
     -Dharfbuzz:freetype=enabled `
+    -Dharfbuzz:glib=disabled `
+    -Dharfbuzz:gobject=disabled `
     -Dlcms2:fastfloat=true `
     -Dlcms2:jpeg=disabled `
     -Dlcms2:tiff=disabled `

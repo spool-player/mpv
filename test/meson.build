@@ -224,7 +224,7 @@ if get_option('libmpv')
         windows_asan = host_machine.system() == 'windows' and address_sanitized
         if features['libcurl'] and not meson.is_cross_build() and not windows_asan
             transport_env = environment()
-            if host_machine.system() == 'linux' and address_sanitized
+            if host_machine.system() in ['linux', 'freebsd'] and address_sanitized
                 # Python loads libmpv with ctypes. Preload the compiler's ASan
                 # runtime so it initializes before Python and the shared library.
                 arch = host_machine.cpu_family() == 'x86' ? 'i386' : host_machine.cpu_family()

@@ -662,7 +662,7 @@ jobs:
 
   freebsd:
     runs-on: ubuntu-latest # until https://github.com/actions/runner/issues/385
-    timeout-minutes: 15 # avoid any weirdness with the VM
+    timeout-minutes: 20 # VM setup, build and the curl transport suite
     defaults:
       run:
         shell: cpa.sh {0} --sync-files none

@@ -255,6 +255,7 @@ rgbf16          => no
 rgbf16be        => no
 rgbf32          => no
 rgbf32be        => no
+starfish        => no
 uyva            => [pa] [un] yuva444p        | a=1:1
 uyva            => [pa] [un] yuva444pf       | a=1:1 [planar-f32]
 uyvy422         => [pa] [un] yuv422p         | a=2:1 [tu] [tp]

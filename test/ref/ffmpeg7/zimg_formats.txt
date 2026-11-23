@@ -136,6 +136,7 @@
       rgbaf32be                              |
          rgbf32                              |
        rgbf32be                              |
+       starfish                              |
         uyvy422    Zin   Zout  SWSin  SWSout |
       uyyvyy411    Zin   Zout                |
           vaapi                              |

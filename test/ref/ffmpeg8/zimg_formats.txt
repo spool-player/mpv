@@ -159,6 +159,7 @@
        rgbf16be                SWSin         |
          rgbf32                SWSin         |
        rgbf32be                SWSin         |
+       starfish                              |
            uyva    Zin   Zout  SWSin  SWSout |
         uyvy422    Zin   Zout  SWSin  SWSout |
       uyyvyy411    Zin   Zout  SWSin         |

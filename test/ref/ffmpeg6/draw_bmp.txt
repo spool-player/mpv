@@ -135,6 +135,7 @@ rgbaf32     = no
 rgbaf32be   = no
 rgbf32      = no
 rgbf32be    = no
+starfish    = no
 uyvy422     = align=2:1 ov=yuva422p, ov_f=yuva422pf, v_f=yuv422pf, a=gray, ca=gray, ca_f=grayf32
 uyyvyy411   = no
 vaapi       = no

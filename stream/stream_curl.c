@@ -37,6 +37,8 @@
 #include <mstcpip.h>
 #include <ws2tcpip.h>
 #define HAVE_SOCKET_PROBES 1
+#else
+#define HAVE_SOCKET_PROBES 0
 #endif
 #if defined(__linux__)
 #include <sys/auxv.h>

@@ -159,6 +159,7 @@ rgbf16      = no
 rgbf16be    = no
 rgbf32      = no
 rgbf32be    = no
+starfish    = no
 uyva        = align=1:1 ov=yuva444p, ov_f=yuva444pf, v_f=yuva444pf, a=unknown, ca=unknown, ca_f=unknown
 uyvy422     = align=2:1 ov=yuva422p, ov_f=yuva422pf, v_f=yuv422pf, a=gray, ca=gray, ca_f=grayf32
 uyyvyy411   = no

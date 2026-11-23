@@ -14,6 +14,7 @@ import hashlib
 import http.server
 import json
 import pathlib
+import platform
 import re
 import shutil
 import ssl
@@ -509,7 +510,21 @@ class CurlTransport(unittest.TestCase):
                 consumer_cpu = metrics["consumer-thread-cpu-seconds"]
                 self.assertGreaterEqual(consumer_cpu, 0)
                 if metrics["consumer-thread-cpu-available"]:
-                    self.assertGreater(consumer_cpu, 0)
+                    if (
+                        sys.platform == "win32"
+                        and platform.machine().lower() in ("arm64", "aarch64")
+                    ):
+                        # ARM Windows uses GetThreadTimes, which can round short work to zero.
+                        sampled_cpu = [
+                            sample["consumer-thread-cpu-seconds"]
+                            for _, sample in result["samples"]
+                            if sample.get("consumer-thread-cpu-available")
+                        ]
+                        self.assertTrue(sampled_cpu)
+                        sampled_cpu.append(consumer_cpu)
+                        self.assertEqual(sampled_cpu, sorted(sampled_cpu))
+                    else:
+                        self.assertGreater(consumer_cpu, 0)
                 for lane in metrics["lane-samples"]:
                     expected = lane["received-bytes"] / lane["active-seconds"]
                     self.assertAlmostEqual(lane["average-bytes-per-second"], expected, delta=2)

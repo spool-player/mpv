@@ -1694,6 +1694,10 @@ rgbf32be: [GENERIC] fcsp=rgb ctype=float
     0: p=0  st=12 o=0  sh=0  d=32
     1: p=0  st=12 o=4  sh=0  d=32
     2: p=0  st=12 o=8  sh=0  d=32
+starfish: fcsp=rgb ctype=unknown
+  Basic desc: [rgb][le][hw]
+    planes=0, chroma=0:0 align=1:1
+    {}
 uyva: [GENERIC] ctype=uint
   Basic desc: [ba][bb][a][yuv][le][be][uint]
     planes=1, chroma=0:0 align=1:1

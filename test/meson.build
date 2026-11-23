@@ -218,10 +218,13 @@ if get_option('libmpv')
         exe = executable('libmpv-lifetime', sources: 'libmpv_lifetime.c',
                          include_directories: incdir_public)
         test('libmpv-lifetime', exe, depends: mpvlib, suite: 'libmpv')
-        # The Python process must use the same ABI as the built libmpv.
-        if features['libcurl'] and not meson.is_cross_build()
+        address_sanitized = get_option('b_sanitize').split(',').contains('address')
+        # ctypes needs the target ABI and a sanitizer that can initialize before
+        # Python and its dependencies. Windows does not support LD_PRELOAD.
+        windows_asan = host_machine.system() == 'windows' and address_sanitized
+        if features['libcurl'] and not meson.is_cross_build() and not windows_asan
             transport_env = environment()
-            if host_machine.system() == 'linux' and get_option('b_sanitize').split(',').contains('address')
+            if host_machine.system() == 'linux' and address_sanitized
                 # Python loads libmpv with ctypes. Preload the compiler's ASan
                 # runtime so it initializes before Python and the shared library.
                 arch = host_machine.cpu_family() == 'x86' ? 'i386' : host_machine.cpu_family()

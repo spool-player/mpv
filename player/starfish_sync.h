@@ -22,12 +22,6 @@ static inline const char *active_audio_out_name(struct MPContext *mpctx)
     return ao ? ao_get_name(ao) : NULL;
 }
 
-static inline bool is_alsa_audio_out(struct MPContext *mpctx)
-{
-    const char *name = active_audio_out_name(mpctx);
-    return name && strcmp(name, "alsa") == 0;
-}
-
 static inline bool is_starfish_audio_out(struct MPContext *mpctx)
 {
     const char *name = active_audio_out_name(mpctx);
@@ -36,7 +30,9 @@ static inline bool is_starfish_audio_out(struct MPContext *mpctx)
 
 static inline bool starfish_split_clock(struct MPContext *mpctx)
 {
-    return is_starfish_video_out(mpctx) && is_alsa_audio_out(mpctx);
+    const char *name = active_audio_out_name(mpctx);
+    return is_starfish_video_out(mpctx) && name
+        && (strcmp(name, "alsa") == 0 || strcmp(name, "pulse") == 0);
 }
 
 static inline bool query_external_video_clock(struct MPContext *mpctx,

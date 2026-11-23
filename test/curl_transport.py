@@ -661,15 +661,16 @@ class CurlTransport(unittest.TestCase):
                                      sample["active-requests"])
                 for row in sample["connections"]:
                     self.assertGreater(row["connection-id"], 0)
-                    self.assertGreater(row["socket-generation"], 0)
                     self.assertEqual(row["http-version"], 11)
-                    self.assertEqual(row["transport"], 1)
+                    if SOCKET_PROBES:
+                        self.assertGreater(row["socket-generation"], 0)
+                        self.assertEqual(row["transport"], 1)
+                    else:
+                        self.assertEqual(row["socket-generation"], 0)
+                        self.assertEqual(row["transport"], 0)
             connections = [sample["physical-connections"] for _, sample in result["samples"]]
-            if SOCKET_PROBES:
-                self.assertGreaterEqual(max(connections), 2)
-                self.assertLessEqual(max(connections), 4)
-            else:
-                self.assertEqual(max(connections), 0)
+            self.assertGreaterEqual(max(connections), 2)
+            self.assertLessEqual(max(connections), 4)
 
     def test_no_validator_withholds_incomplete_range(self):
         # An exact 206 alone cannot authorize exposing a retriable prefix.

@@ -662,7 +662,7 @@ jobs:
 
   freebsd:
     runs-on: ubuntu-latest # until https://github.com/actions/runner/issues/385
-    timeout-minutes: 20 # VM setup, build and the curl transport suite
+    timeout-minutes: 25 # VM setup, sanitized suite and the plain Python consumer
     defaults:
       run:
         shell: cpa.sh {0} --sync-files none
@@ -739,6 +739,11 @@ jobs:
         if: ${{ failure() && steps.tests.outcome == 'failure' }}
         run: |
           cat ./build/meson-logs/testlog.txt
+
+      - name: Run curl transport tests against plain FreeBSD libmpv
+        run: |
+          meson setup --reconfigure build -Db_sanitize=none
+          meson test -C build --print-errorlogs curl-transport
 
   msys2:
     runs-on: ${{ matrix.os }}

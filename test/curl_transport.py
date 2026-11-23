@@ -29,6 +29,9 @@ import urllib.parse
 from typing import Any
 
 
+SOCKET_PROBES = sys.platform.startswith("linux") or sys.platform in ("darwin", "win32")
+
+
 class Node(ctypes.Structure):
     pass
 
@@ -662,8 +665,11 @@ class CurlTransport(unittest.TestCase):
                     self.assertEqual(row["http-version"], 11)
                     self.assertEqual(row["transport"], 1)
             connections = [sample["physical-connections"] for _, sample in result["samples"]]
-            self.assertGreaterEqual(max(connections), 2)
-            self.assertLessEqual(max(connections), 4)
+            if SOCKET_PROBES:
+                self.assertGreaterEqual(max(connections), 2)
+                self.assertLessEqual(max(connections), 4)
+            else:
+                self.assertEqual(max(connections), 0)
 
     def test_no_validator_withholds_incomplete_range(self):
         # An exact 206 alone cannot authorize exposing a retriable prefix.
@@ -903,6 +909,7 @@ class CurlTransport(unittest.TestCase):
             self.assertGreater(demand, 1536000 * 0.75)
             self.assertLess(demand, 1536000 * 1.25)
 
+    @unittest.skipUnless(SOCKET_PROBES, "requires native socket probes")
     def test_fixed_receive_windows_are_applied_before_connect_and_clamps_are_reported(self):
         # This owns the real socket contract, including Linux's doubled
         # accounting. User-space curl buffer settings cannot make it pass.

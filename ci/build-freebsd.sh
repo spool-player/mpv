@@ -3,7 +3,7 @@ set -e
 
 . ./ci/build-common.sh
 
-export CFLAGS="$CFLAGS -isystem/usr/local/include -march=native"
+export CFLAGS="$CFLAGS -isystem/usr/local/include"
 export CXXFLAGS="$CXXFLAGS -isystem/usr/local/include"
 export LDFLAGS="$LDFLAGS -L/usr/local/lib"
 

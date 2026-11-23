@@ -8,6 +8,7 @@
 #define MIB UINT64_C(1048576)
 
 static const double demand_headroom = 1.75;
+static const double recovery_urgency = 0.7;
 
 static int bounded_count(int count, int maximum)
 {
@@ -182,7 +183,7 @@ void mp_curl_controller_tick(struct mp_curl_controller *c, const struct mp_curl_
         c->urgency = 1;
     if (!buffer && !o->playable_progress && !o->paused
         && (o->now_ns - c->started_ns >= SECOND || o->ordered_bytes >= 512 * 1024))
-        c->urgency = fmax(c->urgency, .7);
+        c->urgency = fmax(c->urgency, recovery_urgency);
     // The head range is stalled once it has taken longer than fetching it
     // afresh would: a new request's round trips plus one range at the
     // current per-lane rate, with half again for jitter. A flat timeout
@@ -197,7 +198,7 @@ void mp_curl_controller_tick(struct mp_curl_controller *c, const struct mp_curl_
     bool stalled = o->prefix_incomplete && !o->blocked && !o->paused
         && o->now_ns - c->prefix_progress_ns >= prefix_seconds * SECOND;
     if (stalled)
-        c->urgency = fmax(c->urgency, .7);
+        c->urgency = fmax(c->urgency, recovery_urgency);
     if (c->buffer_slope < -.01 && !o->paused && !o->seeking) {
         if (!c->negative_since_ns)
             c->negative_since_ns = o->now_ns;
@@ -493,7 +494,7 @@ int mp_curl_controller_decide(struct mp_curl_controller *c, const struct mp_curl
         c->reason = MP_CURL_REASON_FIXED;
         return c->target_requests = bounded_count(o->fixed_requests, o->max_requests);
     }
-    bool recovery = c->urgency >= .7 || (c->negative_since_ns && o->now_ns - c->negative_since_ns >= SECOND)
+    bool recovery = c->urgency >= recovery_urgency || (c->negative_since_ns && o->now_ns - c->negative_since_ns >= SECOND)
         || (c->deficit_since_ns && o->now_ns - c->deficit_since_ns >= SECOND);
     int best = mp_curl_controller_best(c, o->max_requests);
     if (recovery && best != selected && c->counts[best - 1].playback_samples

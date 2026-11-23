@@ -183,7 +183,8 @@ static void fixed_and_stall(void)
     o.prefix_incomplete = true;
     o.now_ns += 2 * SECOND;
     mp_curl_controller_tick(&c, &o);
-    assert(c.action == MP_CURL_CANCEL_SUFFIX && c.urgency >= .7);
+    const double recovery_urgency = 0.7;
+    assert(c.action == MP_CURL_CANCEL_SUFFIX && c.urgency >= recovery_urgency);
     o.ordered_bytes += 1;
     o.now_ns += SECOND / 4;
     mp_curl_controller_tick(&c, &o);

@@ -3836,16 +3836,13 @@ static void fill_dynamic(struct priv *p)
     }
     if (p->startup) {
         int64_t now = mp_time_ns();
+        int64_t progress_ns = p->total_ordered != p->controller.last_ordered_bytes
+            ? now : MPMAX(p->startup_ns, p->controller.prefix_progress_ns);
         int desired = p->opts->fixed_requests;
-        if (!desired) {
-            desired = mp_curl_controller_best(&p->controller, p->opts->parallel_requests);
-            // TTFB controls pacing only. Protocol/window decisions use TCP RTT.
-            double rtt_ms = MPMAX(50, p->ttfb_ms);
-            int64_t age = now - p->startup_ns;
-            int ladder = age >= MP_TIME_MS_TO_NS(2 * rtt_ms) ? 4
-                : age >= MP_TIME_MS_TO_NS(rtt_ms) ? 2 : 1;
-            desired = MPMAX(desired, ladder);
-        }
+        if (!desired)
+            desired = mp_curl_controller_startup_requests(&p->controller,
+                p->opts->parallel_requests, p->ctx->media_bitrate, p->ttfb_ms, now,
+                now - p->startup_ns, now - progress_ns);
         p->selected_requests = MPMIN(desired, p->opts->parallel_requests);
         p->urgency = 1;
         if (p->ctx->stream_id == p->stream_id)

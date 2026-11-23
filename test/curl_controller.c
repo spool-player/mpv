@@ -275,8 +275,26 @@ static void simulated_link(const double rates[4], double demand, int expected)
     assert(last_changes <= 2);
 }
 
+static void startup_prefers_a_healthy_single_request(void)
+{
+    struct mp_curl_controller c = { 0 };
+    c.counts[0] = (struct mp_curl_count_evidence) {
+        .source = 1,
+        .samples = 1,
+        .capacity = 23000000,
+        .sampled_ns = SECOND,
+    };
+    assert(mp_curl_controller_startup_requests(&c, 4, 80000000, 74, SECOND, SECOND / 2, 0) == 1);
+    assert(mp_curl_controller_startup_requests(&c, 4, 80000000, 74, SECOND, SECOND / 2, SECOND / 2) == 4);
+    assert(mp_curl_controller_startup_requests(&c, 4, 150000000, 74, SECOND, SECOND / 2, 0) == 4);
+    assert(mp_curl_controller_startup_requests(&c, 2, 80000000, 74, 3601 * SECOND, SECOND / 2, 0) == 2);
+    c.active_profile.http_version = 30;
+    assert(mp_curl_controller_startup_requests(&c, 4, 80000000, 74, SECOND, SECOND / 2, 0) == 4);
+}
+
 int main(void)
 {
+    startup_prefers_a_healthy_single_request();
     acceptance_and_noise();
     constraints_and_invalidations();
     fixed_and_stall();

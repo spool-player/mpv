@@ -113,3 +113,7 @@ void mp_curl_controller_tick(struct mp_curl_controller *c, const struct mp_curl_
 // is applied only after its raw/descriptor shape is admitted by the worker.
 int mp_curl_controller_decide(struct mp_curl_controller *c, const struct mp_curl_observation *o);
 int mp_curl_controller_best(const struct mp_curl_controller *c, int maximum);
+int mp_curl_controller_startup_requests(const struct mp_curl_controller *c,
+                                        int maximum, double demand_bps,
+                                        double ttfb_ms, int64_t now_ns,
+                                        int64_t age_ns, int64_t prefix_wait_ns);

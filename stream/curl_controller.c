@@ -7,6 +7,8 @@
 #define SECOND INT64_C(1000000000)
 #define MIB UINT64_C(1048576)
 
+static const double demand_headroom = 1.75;
+
 static int bounded_count(int count, int maximum)
 {
     maximum = maximum < 1 ? 1 : maximum > 16 ? 16 : maximum;
@@ -69,6 +71,27 @@ int mp_curl_controller_best(const struct mp_curl_controller *c, int maximum)
             return n + 1;
     }
     return 1;
+}
+
+int mp_curl_controller_startup_requests(const struct mp_curl_controller *c,
+                                        int maximum, double demand_bps,
+                                        double ttfb_ms, int64_t now_ns,
+                                        int64_t age_ns, int64_t prefix_wait_ns)
+{
+    const struct mp_curl_count_evidence *single = &c->counts[0];
+    double pacing_ms = fmax(50, ttfb_ms);
+    // Give a proven single request time to open the file. A stalled prefix
+    // still needs the startup ramp, even when the previous run was fast.
+    double grace_ns = clamp(4 * pacing_ms, 250, 500) * (SECOND / 1000);
+    if (prefix_wait_ns < grace_ns && demand_bps > 0
+        && confidence(single, now_ns) >= .125 && compatible_evidence(single, &c->active_profile)
+        && single->capacity >= demand_headroom * demand_bps / 8)
+        return 1;
+
+    int ladder = age_ns >= 2 * pacing_ms * (SECOND / 1000) ? 4
+        : age_ns >= pacing_ms * (SECOND / 1000) ? 2 : 1;
+    int best = mp_curl_controller_best(c, maximum);
+    return bounded_count(ladder > best ? ladder : best, maximum);
 }
 
 static void retire(struct mp_curl_controller *c, int reason)
@@ -408,7 +431,7 @@ int mp_curl_controller_decide(struct mp_curl_controller *c, const struct mp_curl
             spread = reference > 0 ? 0 : INFINITY;
         double margin = fmax(.15, 2 * spread);
         bool fewer = c->candidate < c->baseline;
-        bool adequate = o->demand_bps > 0 && c->candidate_capacity >= 1.75 * o->demand_bps / 8;
+        bool adequate = o->demand_bps > 0 && c->candidate_capacity >= demand_headroom * o->demand_bps / 8;
         double after_slope = (o->buffer_seconds - c->phase_buffer_seconds) / o->phase_seconds;
         // When even the best path cannot yet satisfy demand, a measured
         // reduction of the buffer deficit is useful recovery. Do not reject

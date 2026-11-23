@@ -380,8 +380,13 @@ jobs:
       - name: Get Cache Config
         id: cache_config
         run: |
-          echo "timestamp=`date +%s%N`" >> $GITHUB_OUTPUT
-          echo "prefix=$(brew --prefix)" >> $GITHUB_OUTPUT
+          key_prefix="${{ matrix.os }}"
+          if [[ -z "${{ matrix.homebrew }}" ]]; then
+            key_prefix="$key_prefix-stable-libplacebo"
+          fi
+          echo "key-prefix=$key_prefix" >> "$GITHUB_OUTPUT"
+          echo "timestamp=$(date +%s%N)" >> "$GITHUB_OUTPUT"
+          echo "prefix=$(brew --prefix)" >> "$GITHUB_OUTPUT"
 
       - name: Restore cache
         uses: actions/cache/restore@v6
@@ -389,10 +394,11 @@ jobs:
           path: |
             ${{ steps.cache_config.outputs.prefix }}/Cellar/libplacebo
             ${{ steps.cache_config.outputs.prefix }}/Cellar/ffmpeg-full
-          key: ${{ matrix.os }}-${{ steps.cache_config.outputs.timestamp }}
-          restore-keys: ${{ matrix.os }}-
+          key: ${{ steps.cache_config.outputs.key-prefix }}-${{ steps.cache_config.outputs.timestamp }}
+          restore-keys: ${{ steps.cache_config.outputs.key-prefix }}-
 
       - name: Install dependencies
+        id: dependencies
         run: |
           if [[ -n "${{ matrix.homebrew }}" ]]; then
             export HOMEBREW_NO_AUTO_UPDATE=1
@@ -409,9 +415,16 @@ jobs:
             libarchive libbluray libcaca libcdio-paranoia libdvdnav libdvdread libsixel rubberband vapoursynth zimg
           brew install -q --only-dependencies libplacebo
           brew deps ffmpeg-full | grep -v "^libplacebo$" | xargs brew install -q
-          brew list libplacebo &>/dev/null && brew upgrade --fetch-HEAD libplacebo || brew install -q --HEAD libplacebo
+          if [[ -n "${{ matrix.homebrew }}" ]]; then
+            # The Intel snapshot's stable libplacebo predates mpv's minimum.
+            brew list libplacebo &>/dev/null && brew upgrade --fetch-HEAD libplacebo || brew install -q --HEAD libplacebo
+          else
+            # ffmpeg-full HEAD resolves libplacebo through its stable keg.
+            brew install -q libplacebo
+          fi
           brew list ffmpeg-full &>/dev/null && brew upgrade --fetch-HEAD ffmpeg-full || brew install -q --HEAD ffmpeg-full
           brew link libplacebo ffmpeg-full
+          pkg-config --atleast-version=7.387.0 libplacebo
           brew cleanup -s
 
       - name: Build with meson
@@ -461,12 +474,12 @@ jobs:
 
       - name: Save Cache
         uses: actions/cache/save@v6
-        if: always()
+        if: always() && steps.dependencies.outcome == 'success'
         with:
           path: |
             ${{ steps.cache_config.outputs.prefix }}/Cellar/libplacebo
             ${{ steps.cache_config.outputs.prefix }}/Cellar/ffmpeg-full
-          key: ${{ matrix.os }}-${{ steps.cache_config.outputs.timestamp }}
+          key: ${{ steps.cache_config.outputs.key-prefix }}-${{ steps.cache_config.outputs.timestamp }}
 
   linux:
     runs-on: ubuntu-latest

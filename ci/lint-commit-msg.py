@@ -26,6 +26,8 @@ def get_commit_range() -> str | None:
         return sys.argv[1]
     # https://github.com/actions/runner/issues/342#issuecomment-590670059
     event_name = os.environ["GITHUB_EVENT_NAME"]
+    if event_name == "workflow_dispatch":
+        return "HEAD^!"
     with open(os.environ["GITHUB_EVENT_PATH"], "rb") as f:
         event = json.load(f)
     if event_name == "push":

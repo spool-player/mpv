@@ -239,6 +239,57 @@ static void hysteresis(void)
     assert(c.experiment && c.candidate == 1);
 }
 
+static void startup_physics_and_doubling(void)
+{
+    struct mp_curl_controller c = { 0 };
+    // Fast LAN prior satisfying 1.75x demand keeps 1 lane without speculation.
+    c.last_now_ns = 10 * SECOND;
+    c.active_profile = (struct mp_curl_profile) { .http_version = 11, .connections = 1, .range_bytes = 512 * 1024 };
+    c.counts[0] = (struct mp_curl_count_evidence) {
+        .samples = 4,
+        .playback_samples = 4,
+        .sampled_ns = 9 * SECOND,
+        .capacity = 40000000,
+        .profile = c.active_profile,
+    };
+    struct mp_curl_startup_input lan = {
+        .max_requests = 8,
+        .demand_bps = 80000000,
+        .rtt_ms = 5,
+        .startup_age_ns = 0,
+    };
+    assert(mp_curl_controller_startup_requests(&c, &lan) == 1);
+
+    // High-RTT WAN with 256 KiB receive window and 48 Mbps demand:
+    // 1.75 * 48 Mbps / 8 = 10.5 MB/s; single 256 KiB socket at 150ms = 1.75 MB/s
+    // -> needs >= 6 sockets immediately on RTT 0 to beat window ceiling + IW10!
+    struct mp_curl_controller cold = { 0 };
+    struct mp_curl_startup_input wan = {
+        .max_requests = 8,
+        .demand_bps = 48000000,
+        .rtt_ms = 150,
+        .receive_window_bytes = 262144,
+        .startup_age_ns = 0,
+    };
+    int wan_lanes = mp_curl_controller_startup_requests(&cold, &wan);
+    assert(wan_lanes >= 6 && wan_lanes <= 8);
+
+    // Fixed requests always override startup heuristics.
+    wan.fixed_requests = 2;
+    assert(mp_curl_controller_startup_requests(&cold, &wan) == 2);
+
+    // Severe deficit at 2 lanes (< 1x demand) doubles straight to 4 lanes in
+    // one A/B/A trial instead of crawling +1 per trial.
+    struct mp_curl_observation starving = observation(2);
+    starving.max_requests = 8;
+    starving.demand_bps = 120000000; // 15 MB/s
+    starving.capacity = 6000000;     // 6 MB/s (< 1x demand)
+    starving.ordered_ratio = 0.4;
+    starving.buffer_seconds = 1.0;
+    mp_curl_controller_decide(&cold, &starving);
+    assert(cold.experiment && cold.candidate == 4);
+}
+
 static void simulated_link(const double rates[4], double demand, int expected)
 {
     struct mp_curl_controller c = { 0 };
@@ -285,12 +336,54 @@ static void startup_prefers_a_healthy_single_request(void)
         .capacity = 23000000,
         .sampled_ns = SECOND,
     };
-    assert(mp_curl_controller_startup_requests(&c, 4, 80000000, 74, SECOND, SECOND / 2, 0) == 1);
-    assert(mp_curl_controller_startup_requests(&c, 4, 80000000, 74, SECOND, SECOND / 2, SECOND / 2) == 4);
-    assert(mp_curl_controller_startup_requests(&c, 4, 150000000, 74, SECOND, SECOND / 2, 0) == 4);
-    assert(mp_curl_controller_startup_requests(&c, 2, 80000000, 74, 3601 * SECOND, SECOND / 2, 0) == 2);
+    struct mp_curl_startup_input base = {
+        .max_requests = 4,
+        .demand_bps = 80000000,
+        .ttfb_ms = 74,
+        .now_ns = SECOND,
+        .startup_age_ns = SECOND / 2,
+        .prefix_wait_ns = 0,
+    };
+    assert(mp_curl_controller_startup_requests(&c, &base) == 1);
+
+    struct mp_curl_startup_input stalled = base;
+    stalled.prefix_wait_ns = SECOND / 2;
+    assert(mp_curl_controller_startup_requests(&c, &stalled) == 4);
+
+    struct mp_curl_startup_input heavy = base;
+    heavy.demand_bps = 150000000;
+    assert(mp_curl_controller_startup_requests(&c, &heavy) == 4);
+
+    struct mp_curl_startup_input stale = base;
+    stale.max_requests = 2;
+    stale.now_ns = 3601 * SECOND;
+    assert(mp_curl_controller_startup_requests(&c, &stale) == 2);
+
     c.active_profile.http_version = 30;
-    assert(mp_curl_controller_startup_requests(&c, 4, 80000000, 74, SECOND, SECOND / 2, 0) == 4);
+    assert(mp_curl_controller_startup_requests(&c, &base) == 4);
+}
+
+static void trial_range_amortizes_high_rtt_demand(void)
+{
+    struct mp_curl_controller c = { 0 };
+    struct mp_curl_observation o = observation(4);
+    o.demand_bps = 150000000;
+    o.max_requests = 4;
+    o.rtt_ms = 150;
+    o.ttfb_ms = 150;
+    o.hol_ratio = 0.85;
+    o.capacity = 600000;
+    o.ordered_ratio = o.capacity / (o.demand_bps / 8);
+    o.buffer_seconds = 1.5;
+    o.cache_target_reached = false;
+    o.profile.range_bytes = 16 * MIB;
+    o.range_limit = 16 * MIB;
+    o.free_raw_bytes = 64 * MIB;
+    o.batch_cap = 32 * MIB;
+    o.free_descriptors = 16;
+    mp_curl_controller_decide(&c, &o);
+    assert(c.experiment && c.state == MP_CURL_BASELINE_BEFORE);
+    assert(c.trial_range_bytes >= 1024 * 1024);
 }
 
 int main(void)
@@ -300,6 +393,8 @@ int main(void)
     constraints_and_invalidations();
     fixed_and_stall();
     hysteresis();
+    startup_physics_and_doubling();
+    trial_range_amortizes_high_rtt_demand();
     const double lan[4] = { 30000000, 15000000, 12000000, 9000000 };
     const double capped[4] = { 8000000, 20000000, 20500000, 16000000 };
     const double remote[4] = { 8000000, 16000000, 24000000, 30000000 };

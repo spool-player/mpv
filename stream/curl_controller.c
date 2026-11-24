@@ -75,24 +75,85 @@ int mp_curl_controller_best(const struct mp_curl_controller *c, int maximum)
 }
 
 int mp_curl_controller_startup_requests(const struct mp_curl_controller *c,
-                                        int maximum, double demand_bps,
-                                        double ttfb_ms, int64_t now_ns,
-                                        int64_t age_ns, int64_t prefix_wait_ns)
+                                        const struct mp_curl_startup_input *in)
 {
-    const struct mp_curl_count_evidence *single = &c->counts[0];
-    double pacing_ms = fmax(50, ttfb_ms);
-    // Give a proven single request time to open the file. A stalled prefix
-    // still needs the startup ramp, even when the previous run was fast.
-    double grace_ns = clamp(4 * pacing_ms, 250, 500) * (SECOND / 1000);
-    if (prefix_wait_ns < grace_ns && demand_bps > 0
-        && confidence(single, now_ns) >= .125 && compatible_evidence(single, &c->active_profile)
-        && single->capacity >= demand_headroom * demand_bps / 8)
-        return 1;
+    int maximum = bounded_count(in ? in->max_requests : 1, 16);
+    if (!in)
+        return c ? mp_curl_controller_best(c, maximum) : 1;
+    if (in->fixed_requests > 0)
+        return bounded_count(in->fixed_requests, maximum);
 
-    int ladder = age_ns >= 2 * pacing_ms * (SECOND / 1000) ? 4
-        : age_ns >= pacing_ms * (SECOND / 1000) ? 2 : 1;
-    int best = mp_curl_controller_best(c, maximum);
-    return bounded_count(ladder > best ? ladder : best, maximum);
+    double demand_bps = isfinite(in->demand_bps) && in->demand_bps > 0 ? in->demand_bps : 0;
+    double tcp_rtt = isfinite(in->rtt_ms) && in->rtt_ms > 0 ? in->rtt_ms : 0;
+    double ttfb = isfinite(in->ttfb_ms) && in->ttfb_ms > 0 ? in->ttfb_ms : 0;
+    // When TCP_INFO reports a tiny local-hop RTT (proxy/tunnel/loopback) while
+    // HTTP TTFB is much larger, use bounded TTFB so startup sees true path RTT.
+    double rtt_ms = tcp_rtt >= 10.0 ? tcp_rtt
+        : (ttfb > 0.0 ? fmax(tcp_rtt, fmin(ttfb, 500.0)) : tcp_rtt);
+    double pace_ms = fmax(50.0, rtt_ms);
+
+    // Give a proven healthy single request time to open the file when it
+    // already clears demand headroom. A stalled prefix still needs the ramp.
+    if (c && demand_bps > 0) {
+        const struct mp_curl_count_evidence *single = &c->counts[0];
+        int64_t sample_now = in->now_ns > 0 ? in->now_ns : c->last_now_ns;
+        double grace_ns = clamp(4 * pace_ms, 250, 500) * (SECOND / 1000);
+        if (in->prefix_wait_ns < grace_ns
+            && confidence(single, sample_now) >= .125
+            && compatible_evidence(single, &c->active_profile)
+            && single->capacity >= demand_headroom * demand_bps / 8.0)
+            return 1;
+    }
+
+    int best = c ? mp_curl_controller_best(c, maximum) : 1;
+    int physics = 1;
+    if (rtt_ms >= 35 && demand_bps > 0) {
+        double rtt_s = rtt_ms / 1000.0;
+        double target_bytes_per_sec = demand_headroom * demand_bps / 8.0;
+
+        // 1. Per-socket receive-window BDP floor: when a single socket's window
+        //    cannot carry 1.75x demand over this RTT, open enough sockets up front.
+        int window_lanes = 1;
+        if (in->receive_window_bytes > 0) {
+            double single_socket_rate = (double)in->receive_window_bytes / rtt_s;
+            if (single_socket_rate > 0 && target_bytes_per_sec > single_socket_rate)
+                window_lanes = (int)ceil(target_bytes_per_sec / single_socket_rate);
+        }
+
+        // 2. TCP IW10 slow-start warmup floor: a fresh TCP connection starts at
+        //    ~14.6 KiB and doubles once per RTT. Size parallel connections so
+        //    startup / uncached seek fills ~1.5s of media within ~0.6s instead
+        //    of stalling through 6-8 serial slow-start RTTs.
+        int warmup_lanes = 1;
+        if (rtt_ms >= 50) {
+            double startup_bytes = clamp(1.5 * demand_bps / 8.0, 512.0 * 1024.0, 6.0 * MIB);
+            int target_rtts = (int)clamp(floor(0.6 / rtt_s), 2.0, 5.0);
+            double iw_budget = 14600.0 * (double)((1 << target_rtts) - 1);
+            if (iw_budget > 0)
+                warmup_lanes = (int)ceil(startup_bytes / iw_budget);
+            if (warmup_lanes > 8)
+                warmup_lanes = 8;
+        }
+        physics = window_lanes > warmup_lanes ? window_lanes : warmup_lanes;
+    }
+
+    // Progressive time-based ladder handles unknown-bitrate streams and
+    // conservative ramp on shorter paths.
+    int64_t age = in->startup_age_ns > 0 ? in->startup_age_ns : 0;
+    int64_t one_rtt_ns = (int64_t)(pace_ms * 1000000.0);
+    int ladder = 1;
+    if (rtt_ms >= 50) {
+        ladder = age >= 2 * one_rtt_ns ? 6 : age >= one_rtt_ns ? 4 : 2;
+    } else {
+        ladder = age >= 2 * one_rtt_ns ? 4 : age >= one_rtt_ns ? 2 : 1;
+    }
+
+    int desired = best;
+    if (physics > desired)
+        desired = physics;
+    if (ladder > desired)
+        desired = ladder;
+    return bounded_count(desired, maximum);
 }
 
 static void retire(struct mp_curl_controller *c, int reason)
@@ -322,7 +383,18 @@ static bool shape(struct mp_curl_controller *c, const struct mp_curl_observation
         uint64_t units = 1;
         while (units < (uint64_t)(2 * k))
             units *= 2;
-        uint64_t paced = power_floor((uint64_t)(o->capacity / units));
+        double pace_rate = o->capacity;
+        // Never shrink trial ranges below what amortizes path RTT at playback
+        // demand; a temporarily HOL-depressed capacity reading would otherwise
+        // collapse range size to 64 KiB on a high-RTT WAN link and choke the
+        // trial itself to RTT-bound throughput.
+        if (o->hol_ratio >= 0.5 && isfinite(o->rtt_ms) && o->rtt_ms >= 100
+            && isfinite(o->demand_bps) && o->demand_bps > 0) {
+            double bdp_rate = (o->demand_bps / 8.0) * fmax(1.0, o->rtt_ms / 50.0);
+            if (bdp_rate > pace_rate)
+                pace_rate = bdp_rate;
+        }
+        uint64_t paced = power_floor((uint64_t)(pace_rate / units));
         if (paced < range)
             range = paced < smallest ? smallest : paced;
     }
@@ -379,7 +451,11 @@ int mp_curl_controller_decide(struct mp_curl_controller *c, const struct mp_curl
     if (o->seeking) {
         c->active_profile = o->profile;
         int best = mp_curl_controller_best(c, o->max_requests);
-        c->target_requests = o->fixed_requests ? bounded_count(o->fixed_requests, o->max_requests) : best;
+        int seek_target = best;
+        if (selected > best && !(c->counts[best - 1].playback_samples > 0
+                && o->demand_bps > 0 && c->counts[best - 1].capacity >= 1.75 * o->demand_bps / 8))
+            seek_target = selected;
+        c->target_requests = o->fixed_requests ? bounded_count(o->fixed_requests, o->max_requests) : seek_target;
         c->action = MP_CURL_RESTORE;
         c->recovery_adoption = true;
         c->reason = MP_CURL_REASON_STARTUP;
@@ -513,22 +589,36 @@ int mp_curl_controller_decide(struct mp_curl_controller *c, const struct mp_curl
     bool hol_pressure = o->hol_ratio > .2 && o->reorder_growing && !short_of_demand;
     bool pressure = hol_pressure
         || (o->worker_cpu_available && o->worker_cpu >= .85 && previous > 0 && o->capacity < previous * .95);
+    int step_up = selected + 1;
+    // Symmetric with downward halving: when actively starving below 1x media
+    // bitrate, double the lane count rather than crawling +1 per A/B/A trial.
+    if (selected >= 2 && o->demand_bps > 0 && o->capacity < o->demand_bps / 8) {
+        int doubled = bounded_count(selected * 2, o->max_requests);
+        if (doubled > selected && !rejected(&c->counts[doubled - 1], o))
+            step_up = doubled;
+    }
     bool more = short_of_demand && o->network_wait_available
         && o->network_wait_ratio >= .5 && o->storage_ratio < .05 && o->hol_ratio < (short_of_demand ? .5 : .1)
         && (!o->worker_cpu_available || o->worker_cpu < .7) && selected < o->max_requests
-        && !rejected(&c->counts[selected], o);
+        && !rejected(&c->counts[step_up - 1], o);
     // Short of demand with no useful step up, a learned count must still be
     // able to decay: on a contended or serialising origin fewer requests do
     // as well or better. Two seconds between trials let a descent finish
     // within a short playback; rejected counts stay rejected.
-    bool fewer = short_of_demand && selected > 1 && !rejected(&c->counts[selected / 2 - 1], o)
+    bool genuinely_short = o->demand_bps > 0
+        && (o->capacity < 1.15 * o->demand_bps / 8
+            || (c->buffer_seen && c->buffer_slope < -.01)
+            || o->hol_ratio > .15);
+    bool fewer = short_of_demand && genuinely_short && selected > 1
+        && (selected == o->max_requests || rejected(&c->counts[step_up - 1], o))
+        && !rejected(&c->counts[selected / 2 - 1], o)
         && (!c->last_trial_ns || o->now_ns - c->last_trial_ns >= 2 * SECOND);
     if (pressure && selected > 1) {
         candidate--;
         reason = hol_pressure ? MP_CURL_REASON_HOL : MP_CURL_REASON_CPU;
         recovery = true;
     } else if (more) {
-        candidate++;
+        candidate = step_up;
         reason = MP_CURL_REASON_DEMAND;
     } else if (fewer) {
         // Halve rather than step: a starving consumer cannot wait out one

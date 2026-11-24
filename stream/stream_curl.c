@@ -63,6 +63,7 @@
 #include "stream_curl.h"
 #include "curl_controller.h"
 #include "curl_budget.h"
+#include "curl_policy.h"
 
 #include "common/common.h"
 #include "common/global.h"
@@ -448,9 +449,14 @@ struct priv {
     int64_t pool_id, grant_seen;
     int receive_mode, http_mode;
     int64_t receive_bytes;
+    int64_t measured_receive_bytes;
     bool pool_transition;
     int http_limit; // monotonic downgrade: 0, 20 (TCP), 11 (HTTP/1.1)
     int http_fallbacks, last_reason;
+    bool h3_advertised;
+    bool auto_prefer_h1;
+    bool auto_h3_active;
+    struct mp_curl_h3_watch h3_watch;
     bool udp_limited;
     int64_t udp_requested, udp_effective;
     double urgency;
@@ -561,7 +567,7 @@ struct priv {
 struct origin_state {
     char key[512];
     int64_t id, h2_until, h3_until, used;
-    bool h2_seen, h3_seen;
+    bool h2_seen, h3_seen, h3_advertised;
 };
 static int detect_hw_aes(void);
 static mp_static_mutex origin_lock = MP_STATIC_MUTEX_INITIALIZER;
@@ -648,6 +654,64 @@ static void origin_supported(const char *key, int version)
     mp_mutex_unlock(&origin_lock);
 }
 
+static void origin_record_h3_alt_svc(const char *key, bool advertised)
+{
+    if (!key || !key[0])
+        return;
+    origin_limit(key, 0);
+    mp_mutex_lock(&origin_lock);
+    for (int n = 0; n < MP_ARRAY_SIZE(origins); n++) {
+        if (!strcmp(origins[n].key, key)) {
+            origins[n].h3_advertised = advertised;
+            break;
+        }
+    }
+    mp_mutex_unlock(&origin_lock);
+}
+
+static bool origin_h3_state(const char *key, int64_t *cooldown_until_ns)
+{
+    bool advertised = false;
+    if (cooldown_until_ns)
+        *cooldown_until_ns = 0;
+    if (!key || !key[0])
+        return false;
+    mp_mutex_lock(&origin_lock);
+    for (int n = 0; n < MP_ARRAY_SIZE(origins); n++) {
+        if (!strcmp(origins[n].key, key)) {
+            advertised = origins[n].h3_advertised || origins[n].h3_seen;
+            if (cooldown_until_ns)
+                *cooldown_until_ns = origins[n].h3_until;
+            break;
+        }
+    }
+    mp_mutex_unlock(&origin_lock);
+    return advertised;
+}
+
+// Check if Alt-Svc advertises same-authority HTTP/3 (h3=":port").
+static bool parse_same_authority_h3(const char *alt_svc, const char *origin)
+{
+    if (!alt_svc || !alt_svc[0] || !origin || strncmp(origin, "https://", 8) != 0)
+        return false;
+    if (strcasecmp(alt_svc, "clear") == 0)
+        return false;
+    const char *port = strrchr(origin + 8, ':');
+    if (!port || !port[1])
+        return false;
+    port++;
+    char token[32];
+    if (snprintf(token, sizeof(token), "h3=\":%s\"", port) >= (int)sizeof(token))
+        return false;
+    for (const char *s = alt_svc; *s; s++) {
+        if (strncasecmp(s, token, strlen(token)) == 0) {
+            if (s == alt_svc || s[-1] == ' ' || s[-1] == ',' || s[-1] == '\t')
+                return true;
+        }
+    }
+    return false;
+}
+
 static void snapshot_origins(struct mp_curl_metrics *metrics, int64_t now)
 {
     mp_mutex_lock(&origin_lock);
@@ -698,13 +762,18 @@ static void apply_http_policy(struct priv *p, CURL *curl)
         int limit = origin_limit(p->origin, 0);
         if (p->http_limit && (!limit || p->http_limit < limit))
             limit = p->http_limit;
-        version = !tls || p->http_mode == 2 || limit == 11 || !cap.http2
-            ? CURL_HTTP_VERSION_1_1 : CURL_HTTP_VERSION_2TLS;
-        if (tls && p->http_mode == 3 && !limit && cap.http3 && !p->udp_limited)
+        bool want_h1 = !tls || p->http_mode == 2 || limit == 11 || !cap.http2
+            || (p->http_mode == 0 && p->auto_prefer_h1);
+        version = want_h1 ? CURL_HTTP_VERSION_1_1 : CURL_HTTP_VERSION_2TLS;
+        bool want_h3 = tls && !limit && cap.http3 && !p->udp_limited
+            && (p->http_mode == 3 || (p->http_mode == 0 && p->auto_h3_active));
+        if (want_h3)
             version = CURL_HTTP_VERSION_3;
     }
     curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, version);
-
+    // Only wait for ALPN multiplexing when actually using HTTP/2.
+    // Parallel HTTP/1.1 sockets must connect concurrently without waiting.
+    curl_easy_setopt(curl, CURLOPT_PIPEWAIT, version == CURL_HTTP_VERSION_2TLS ? 1L : 0L);
 }
 
 static bool downgrade_http(struct priv *p, struct curl_handle_ref *ref, CURLcode code)
@@ -727,6 +796,8 @@ static bool downgrade_http(struct priv *p, struct curl_handle_ref *ref, CURLcode
         origin_limit(origin, failed);
     origin_limit(p->origin, failed);
     p->http_limit = failed == 30 ? 20 : 11;
+    if (failed == 30)
+        p->auto_h3_active = false;
     p->http_fallbacks++;
     ref->fresh_connection = true;
     p->last_reason = failed == 30 ? 37 : 38;
@@ -969,7 +1040,8 @@ static void begin_measurement(struct curl_handle_ref *ref)
     ref->received = 0;
     ref->last_progress_ns = now;
     ref->requested_h3 = p->opts->http_version == CURL_HTTP_VERSION_NONE &&
-        p->http_mode == 3 && (curl_version_info(CURLVERSION_NOW)->features & CURL_VERSION_HTTP3) && !p->http_limit && !origin_limit(p->origin, 0) &&
+        (p->http_mode == 3 || (p->http_mode == 0 && p->auto_h3_active)) &&
+        (curl_version_info(CURLVERSION_NOW)->features & CURL_VERSION_HTTP3) && !p->http_limit && !origin_limit(p->origin, 0) &&
         !strncmp(p->url, "https://", 8);
     ref->blocked = false;
     ref->measuring = true;
@@ -1202,22 +1274,26 @@ static bool select_stream_pool(struct priv *p)
 {
     struct curl_ctx *ctx = p->ctx;
     bool manual = p->opts->receive_mode == 2;
-    bool enough = 2ULL * p->opts->receive_bytes <=
+    bool measured = p->opts->receive_mode == 1 && p->measured_receive_bytes > 0;
+    int64_t desired_receive = manual ? p->opts->receive_bytes : measured ? p->measured_receive_bytes : 0;
+    bool enough = desired_receive > 0 && 2ULL * (uint64_t)desired_receive <=
         (ctx->budget.desired_extra > ctx->budget.sockets ? ctx->budget.desired_extra - ctx->budget.sockets : 0);
-    // Existing committed manual sockets remain valid under an unchanged
+    // Existing committed manual/measured sockets remain valid under an unchanged
     // grant; pressure prevents creating another socket/profile, not delivery.
-    if (p->pool == ctx->trial && p->receive_mode == 2 &&
+    if (p->pool == ctx->trial && p->receive_mode == 2 && p->receive_bytes == desired_receive &&
         ctx->budget.desired_extra >= ctx->budget.sockets && p->receive_admitted)
         enough = true;
-    int receive_mode = manual && enough ? 2 : 0;
+    int receive_mode = (manual || measured) && enough ? 2 : 0;
     int http_mode = p->opts->http_mode;
-    bool isolated = receive_mode == 2 || http_mode == 3;
+    int effective_http_mode = (http_mode == 0 && p->auto_h3_active) ? 3
+        : (http_mode == 0 && p->auto_prefer_h1) ? 2 : http_mode;
+    bool isolated = receive_mode == 2 || effective_http_mode == 3 || effective_http_mode == 2;
     CURLM *selected = ctx->multi;
     int64_t id = 1;
     if (isolated) {
         bool compatible = ctx->trial && ctx->trial_receive_mode == receive_mode &&
-            ctx->trial_receive_bytes == (receive_mode == 2 ? p->opts->receive_bytes : 0) &&
-            ctx->trial_http_mode == http_mode;
+            ctx->trial_receive_bytes == (receive_mode == 2 ? desired_receive : 0) &&
+            ctx->trial_http_mode == effective_http_mode;
         if (!compatible && ctx->trial) {
             retire_trial_pool(ctx);
             if (ctx->trial) {
@@ -1242,9 +1318,10 @@ static bool select_stream_pool(struct priv *p)
             ctx->trial_buffer_charge = charge;
             ctx->trial_id = ++ctx->next_pool_id;
             ctx->trial_receive_mode = receive_mode;
-            ctx->trial_receive_bytes = receive_mode == 2 ? p->opts->receive_bytes : 0;
-            ctx->trial_http_mode = http_mode;
-            curl_multi_setopt(ctx->trial, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
+            ctx->trial_receive_bytes = receive_mode == 2 ? desired_receive : 0;
+            ctx->trial_http_mode = effective_http_mode;
+            curl_multi_setopt(ctx->trial, CURLMOPT_PIPELINING,
+                              effective_http_mode == 2 ? CURLPIPE_NOTHING : CURLPIPE_MULTIPLEX);
             curl_multi_setopt(ctx->trial, CURLMOPT_MAXCONNECTS, 64L);
             curl_multi_setopt(ctx->trial, CURLMOPT_MAX_HOST_CONNECTIONS, 18L);
         }
@@ -1260,7 +1337,7 @@ static bool select_stream_pool(struct priv *p)
         p->pool_id = id;
     }
     p->receive_mode = receive_mode;
-    p->receive_bytes = p->opts->receive_bytes;
+    p->receive_bytes = receive_mode == 2 ? desired_receive : p->opts->receive_bytes;
     p->http_mode = http_mode;
     p->receive_admitted = !manual || receive_mode == 2;
     if (manual && receive_mode != 2)
@@ -1319,7 +1396,7 @@ static void run_cmd(void *arg)
         // Small enough that a full queue of them fits the baseline budget;
         // size_ranges() grows them once a long, fast path is measured.
         c->p->segment_size = MPMIN(c->p->opts->max_request_size,
-            MPMIN(512 << 10, c->p->buffer_size / c->p->opts->parallel_requests));
+            MPMIN(512 << 10, MPMAX(64 << 10, c->p->buffer_size / c->p->opts->parallel_requests)));
         if (ctx->epoch && ctx->configured.primary_origin[0]) {
             char origin[512];
             canonical_origin(ctx->configured.primary_origin, origin, sizeof(origin));
@@ -1921,10 +1998,12 @@ static void sample_sockets(struct curl_ctx *ctx)
         // Old SDKs have a shorter struct; trust only fields the kernel filled.
         struct tcp_info tcp = {0};
         len = sizeof(tcp);
-        if (getsockopt(info->fd, IPPROTO_TCP, TCP_INFO, &tcp, &len) == 0 &&
-            len >= offsetof(struct tcp_info, tcpi_rtt) + sizeof(tcp.tcpi_rtt))
-        {
-            info->rtt_ms = tcp.tcpi_rtt / 1000.0;
+        if (getsockopt(info->fd, IPPROTO_TCP, TCP_INFO, &tcp, &len) == 0) {
+            if (len >= offsetof(struct tcp_info, tcpi_rtt) + sizeof(tcp.tcpi_rtt))
+                info->rtt_ms = tcp.tcpi_rtt / 1000.0;
+            if (len >= offsetof(struct tcp_info, tcpi_rcv_space) + sizeof(tcp.tcpi_rcv_space) &&
+                tcp.tcpi_rcv_space > 0)
+                info->receive_window = tcp.tcpi_rcv_space;
         }
 #elif defined(__APPLE__) && defined(TCP_CONNECTION_INFO)
         struct tcp_connection_info tcp = {0};
@@ -2931,6 +3010,11 @@ static size_t dynamic_header_callback(char *buffer, size_t size, size_t nitems,
     int64_t total = -1;
     // Every range belongs to the primary's representation. Once a strong
     // validator is known, its omission is not permission to splice bytes.
+    const char *alt_svc = header_value(request->curl, "Alt-Svc");
+    if (alt_svc && parse_same_authority_h3(alt_svc, p->origin)) {
+        p->h3_advertised = true;
+        origin_record_h3_alt_svc(p->origin, true);
+    }
     const char *etag = header_value(request->curl, "ETag");
     bool same_entity = !p->etag || (etag && strcmp(etag, p->etag) == 0);
     // HTTP error documents may carry unrelated validators, or none. Reject
@@ -2959,8 +3043,10 @@ static void finalize_probe(struct priv *p)
     curl_easy_getinfo(p->curl, CURLINFO_CONTENT_TYPE, &ctype);
     curl_easy_getinfo(p->curl, CURLINFO_EFFECTIVE_URL, &effective);
     bstr mime = bstr_strip(bstr_split(bstr0(ctype), ";", NULL));
-    p->probe_mime_type = mime.len ? bstrto0(p, mime) : NULL;
-    p->probe_effective_url = talloc_strdup(p, effective);
+    talloc_free(p->probe_mime_type);
+    talloc_free(p->probe_effective_url);
+    p->probe_mime_type = mime.len ? bstrto0(NULL, mime) : NULL;
+    p->probe_effective_url = talloc_strdup(NULL, effective);
 
     if (mp_msg_test(p->log, MSGL_DEBUG)) {
         long resp = 0;
@@ -3070,12 +3156,24 @@ static void probe_http(struct priv *p, struct bstr line)
     }
 
     const char *cd = header_value(p->curl, "Content-Disposition");
-    if (cd)
-        p->server_filename = mp_parse_content_disposition(p, p->s, bstr0(cd));
+    if (cd) {
+        talloc_free(p->server_filename);
+        p->server_filename = mp_parse_content_disposition(NULL, p->s, bstr0(cd));
+    }
     // Weak validators (W/"...") do not promise byte-identical ranges.
+    const char *alt_svc = header_value(p->curl, "Alt-Svc");
+    if (alt_svc) {
+        bool has_h3 = parse_same_authority_h3(alt_svc, p->origin);
+        if (has_h3 || strcasecmp(alt_svc, "clear") == 0) {
+            p->h3_advertised = has_h3;
+            origin_record_h3_alt_svc(p->origin, has_h3);
+        }
+    } else if (origin_h3_state(p->origin, NULL)) {
+        p->h3_advertised = true;
+    }
     const char *etag = header_value(p->curl, "ETag");
     talloc_free(p->etag);
-    p->etag = etag && etag[0] == '"' ? talloc_strdup(p, etag) : NULL;
+    p->etag = etag && etag[0] == '"' ? talloc_strdup(NULL, etag) : NULL;
 
     p->stream_ok = true;
     p->response_ok = true;
@@ -3511,23 +3609,74 @@ static struct mp_curl_observation stream_observation(struct priv *p, int64_t now
 // next response. Bounded by the request limit, 16 MiB and half of the raw
 // budget across all lanes; only ever grown, by factors of two or more, so a
 // short path keeps the small ranges its memory budget was shaped for.
+static double effective_path_rtt_ms(double tcp_rtt_ms, double ttfb_ms)
+{
+    if (tcp_rtt_ms >= 10.0)
+        return tcp_rtt_ms;
+    if (ttfb_ms > 0.0)
+        return MPMAX(tcp_rtt_ms > 0.0 ? tcp_rtt_ms : 0.0, MPMIN(ttfb_ms, 500.0));
+    return tcp_rtt_ms;
+}
+
+static void inspect_tcp_sockets(const struct priv *p, double *out_rtt_ms,
+                                uint64_t *out_rcv_wnd, int *out_tcp_conns)
+{
+    double rtt_ms = -1;
+    uint64_t rcv_wnd = 0;
+    int conns = 0;
+#if HAVE_SOCKET_PROBES
+    for (int n = 0; n < MP_CURL_MAX_SOCKETS; n++) {
+        const struct curl_socket_info *socket = &p->ctx->sockets[n];
+        if (socket->fd == CURL_SOCKET_BAD || !socket->tcp)
+            continue;
+        conns++;
+        if (socket->rtt_ms >= 0)
+            rtt_ms = MPMAX(rtt_ms, socket->rtt_ms);
+        if (socket->receive_window > 0)
+            rcv_wnd = rcv_wnd ? MPMIN(rcv_wnd, (uint64_t)socket->receive_window)
+                              : (uint64_t)socket->receive_window;
+    }
+#endif
+    if (out_rtt_ms)
+        *out_rtt_ms = rtt_ms;
+    if (out_rcv_wnd)
+        *out_rcv_wnd = rcv_wnd;
+    if (out_tcp_conns)
+        *out_tcp_conns = conns;
+}
+
 static void size_ranges(struct priv *p)
 {
-    if (p->control_phase || p->startup || p->transitioning || p->opts->max_request_size <= 0)
+    if (p->control_phase || p->transitioning || p->opts->max_request_size <= 0 || p->paused)
         return;
     int lanes = MPCLAMP(p->selected_requests, 1, 16);
+    double tcp_rtt_ms = -1;
+    inspect_tcp_sockets(p, &tcp_rtt_ms, NULL, NULL);
+    // Only grow ranges early during startup or from provisional capacity when
+    // kernel socket telemetry confirms a genuinely high-RTT path; high TTFB on
+    // a short path can reflect server queueing/serialization rather than BDP.
+    bool real_high_rtt = tcp_rtt_ms >= 100.0;
+    if (p->startup && !real_high_rtt)
+        return;
+    double rtt = (real_high_rtt ? tcp_rtt_ms : MPMAX(p->ttfb_ms, 0.0)) / 1000.0;
     double capacity = p->controller.counts[lanes - 1].capacity;
-    double rtt = MPMAX(p->ttfb_ms, 0) / 1000;
-    // Short paths keep the ranges the queue and its memory were shaped for.
+    if (real_high_rtt) {
+        if (!(capacity > 0) && p->ctx->capacity > 0)
+            capacity = (double)p->ctx->capacity;
+        if (!(capacity > 0) && p->ctx->media_bitrate > 0)
+            capacity = p->ctx->media_bitrate / 8.0 * 1.75;
+    }
+    // Short paths keep the compact ranges the queue and its memory were shaped for.
     if (!(capacity > 0) || !(rtt >= .1) || p->paused)
         return;
     uint64_t budget = p->ctx->budget.baseline + p->ctx->budget.desired_extra;
-    uint64_t upper = MPMIN(MPMIN((uint64_t)p->opts->max_request_size, 16 << 20),
-                           budget / (2 * (uint64_t)p->opts->parallel_requests));
+    uint64_t denom_lanes = real_high_rtt ? MPMAX(2, lanes) : (uint64_t)p->opts->parallel_requests;
+    uint64_t upper = MPMIN(MPMIN((uint64_t)p->opts->max_request_size, 16ULL << 20),
+                           budget / (2 * denom_lanes));
     uint64_t lower = MPMAX(p->segment_size, 1);
     if (upper <= lower)
         return;
-    uint64_t target = (uint64_t)MPCLAMP(capacity / lanes * rtt * 8, lower, upper);
+    uint64_t target = (uint64_t)MPCLAMP(capacity / lanes * rtt * 8.0, lower, upper);
     uint64_t size = lower;
     while (size * 2 <= target)
         size *= 2;
@@ -3535,6 +3684,186 @@ static void size_ranges(struct priv *p)
         MP_VERBOSE(p, "range size %zu -> %" PRIu64 " (rtt %.0f ms)\n",
                    p->segment_size, size, rtt * 1000);
         p->segment_size = size;
+    }
+}
+
+// Wire curl_policy decisions for auto HTTP version selection (escaping the
+// HTTP/2 single-socket multiplexing trap or promoting eligible HTTP/3) and
+// measured TCP receive-window overrides.
+static void evaluate_auto_transport(struct priv *p, int64_t now)
+{
+    struct curl_ctx *ctx = p->ctx;
+    double tcp_rtt_ms = -1;
+    uint64_t rcv_wnd = 0;
+    int tcp_conns = 0;
+    inspect_tcp_sockets(p, &tcp_rtt_ms, &rcv_wnd, &tcp_conns);
+    double effective_rtt_ms = effective_path_rtt_ms(tcp_rtt_ms, p->ttfb_ms);
+    bool tls = !strncmp(p->url, "https://", 8);
+
+    // 1. Guard active automatic HTTP/3 with mp_curl_h3_revert().
+    if (p->http_mode == 0 && p->auto_h3_active) {
+        uint64_t udp_drops = 0;
+        bool drops_available = false;
+#if HAVE_SOCKET_PROBES
+        for (int n = 0; n < MP_CURL_MAX_SOCKETS; n++) {
+            const struct curl_socket_info *s = &ctx->sockets[n];
+            if (s->fd != CURL_SOCKET_BAD && !s->tcp && s->udp_drops >= 0) {
+                udp_drops += (uint64_t)s->udp_drops;
+                drops_available = true;
+            }
+        }
+#endif
+        struct mp_curl_h3_window w = {
+            .end_ns = now,
+            .worker_cpu = ctx->worker_cpu,
+            .worker_cpu_available = ctx->worker_cpu_available,
+            .udp_drops = udp_drops,
+            .udp_drops_available = drops_available,
+        };
+        int revert = mp_curl_h3_revert(&p->h3_watch, &w);
+        if (revert != MP_CURL_REASON_NONE) {
+            MP_INFO(p, "reverting automatic HTTP/3 (reason %d)\n", revert);
+            p->auto_h3_active = false;
+            p->pool_transition = true;
+            p->last_reason = revert;
+            origin_limit(p->origin, 30);
+        }
+    }
+
+    // 2. Smart HTTP version selection in auto mode (http_mode == 0) over HTTPS.
+    if (p->http_mode == 0 && tls && p->opts->http_version == CURL_HTTP_VERSION_NONE
+        && !p->control_phase) {
+        int effective_proto = p->evidence_http ? p->evidence_http : p->primary_ref.http_version;
+        bool h2_active = effective_proto == 20;
+        bool single_socket_bound = false;
+        if (effective_rtt_ms >= 35 && ctx->media_bitrate > 0 && rcv_wnd > 0) {
+            double single_rate = (double)rcv_wnd / (effective_rtt_ms / 1000.0);
+            if (1.75 * ctx->media_bitrate / 8.0 > single_rate)
+                single_socket_bound = true;
+        }
+        bool deficit = ctx->media_bitrate > 0 && ctx->capacity > 0
+            && (double)ctx->capacity < 1.75 * ctx->media_bitrate / 8.0;
+        bool h2_hol = h2_active && tcp_conns <= 1 && p->selected_requests >= 2
+            && (p->ttfb_ms > 2.5 * MPMAX(25.0, effective_rtt_ms) || deficit);
+        bool multi_socket_needed = p->selected_requests >= 2
+            && (effective_rtt_ms >= 50 || single_socket_bound || h2_hol);
+
+        // Check whether Alt-Svc HTTP/3 is eligible via curl_policy.
+        if (multi_socket_needed && !p->auto_h3_active && p->h3_advertised && !p->udp_limited) {
+            struct mp_curl_capabilities cap;
+            mp_curl_get_capabilities(&cap);
+            int64_t cooldown_until = 0;
+            origin_h3_state(p->origin, &cooldown_until);
+            uint64_t udp_avail = ctx->budget.desired_extra > ctx->budget.sockets
+                ? (ctx->budget.desired_extra - ctx->budget.sockets) / 2 : 0;
+            if (ctx->host_rmem_max > 0)
+                udp_avail = MPMIN(udp_avail, (uint64_t)ctx->host_rmem_max);
+            struct mp_curl_h3_input h3_in = {
+                .now_ns = now,
+                .cooldown_until_ns = cooldown_until,
+                .prefer_h3 = false,
+                .https = true,
+                .http3_supported = cap.http3,
+                .capability_evidence = p->h3_advertised,
+                .rtt_available = effective_rtt_ms > 0,
+                .h2_head_of_line = h2_hol,
+                .counts_settled = !p->startup && p->capacity_samples >= 1,
+                .ranges_settled = !p->startup,
+                .rtt_ms = effective_rtt_ms,
+                .tcp_capacity_bytes_per_second = (double)ctx->capacity,
+                .demand_bps = ctx->media_bitrate,
+                .worker_cpu_available = ctx->worker_cpu_available,
+                .tcp_cpu_available = ctx->protocol_metrics[1].cpu_available,
+                .constrained = ctx->budget.baseline <= (4 << 20),
+                .worker_cpu = ctx->worker_cpu,
+                .tcp_cpu_ns_per_byte = ctx->protocol_metrics[1].cpu_ns_per_ordered_byte,
+                .hw_aes = cap.hw_aes,
+                .quic_batching = cap.quic_batching,
+                .udp_buffer_available = udp_avail > 0,
+                .udp_effective_bytes = udp_avail,
+                .scheduling_lateness_p99_ms = ctx->lateness_available ? ctx->lateness_p99_ms : 0,
+            };
+            struct mp_curl_policy_decision h3_dec = mp_curl_h3_eligible(&h3_in);
+            if (h3_dec.eligible) {
+                MP_INFO(p, "promoting auto HTTPS stream to HTTP/3 (rtt %.0f ms)\n", effective_rtt_ms);
+                p->auto_h3_active = true;
+                p->auto_prefer_h1 = false;
+                p->pool_transition = true;
+                p->last_reason = MP_CURL_REASON_PROTOCOL;
+            }
+        }
+
+        // Escape the HTTP/2 single-TCP-socket trap: when multiple physical
+        // sockets are needed to beat IW10 slow-start or per-socket windows,
+        // switch dynamic transfers to parallel HTTP/1.1 connections.
+        if (!p->auto_h3_active && multi_socket_needed && !p->auto_prefer_h1) {
+            MP_INFO(p, "switching auto HTTPS stream to multi-socket HTTP/1.1 "
+                       "(requests=%d rtt=%.0fms ttfb=%.0fms tcp_conns=%d)\n",
+                    p->selected_requests, effective_rtt_ms, p->ttfb_ms, tcp_conns);
+            p->auto_prefer_h1 = true;
+            p->last_reason = MP_CURL_REASON_PROTOCOL;
+            int active_dynamic = 0;
+            for (int n = 0; n < p->num_requests; n++) {
+                if (p->requests[n].active)
+                    active_dynamic++;
+                else
+                    p->requests[n].ref.fresh_connection = true;
+            }
+            if (active_dynamic > 0) {
+                p->pool_transition = true;
+                p->generation++;
+                p->transitioning = p->learning_active;
+                reset_phase(p, now);
+            } else {
+                // No dynamic transfers are in flight yet; switch p->pool right
+                // now so every dynamic handle (and future seek) opens clean
+                // HTTP/1.1 sockets isolated from primary_ref's HTTP/2 pool.
+                select_stream_pool(p);
+            }
+        }
+    }
+
+    // 3. Evaluate measured TCP receive-window overrides via mp_curl_window_candidate().
+    if (p->opts->receive_mode == 1 && !p->control_phase && !p->pool_transition
+        && tcp_rtt_ms >= 100 && tcp_conns >= 1) {
+        uint64_t avail_sock = ctx->budget.desired_extra > ctx->budget.sockets
+            ? ctx->budget.desired_extra - ctx->budget.sockets : 0;
+        bool starving = ctx->media_bitrate > 0 && ctx->capacity > 0
+            && (double)ctx->capacity < 1.5 * ctx->media_bitrate / 8.0;
+        struct mp_curl_window_input win = {
+            .file_average_bps = ctx->declared_bitrate,
+            .delivery_average_bps = ctx->media_bitrate,
+            .observed_peak_bps = ctx->recent_demand,
+            .observed_steady_bps = ctx->demand_ewma,
+            .playback_speed = ctx->playback_state.speed > 0 ? ctx->playback_state.speed : 1.0,
+            .rtt_ms = tcp_rtt_ms,
+            .producer_backpressure = p->ring_waiting ? 0.5 : 0.0,
+            .rtt_available = true,
+            .consumer_draining = !ctx->playback_paused && !ctx->playback_state.eof,
+            .receive_ceiling_suspected = starving,
+            .receive_window_available = rcv_wnd > 0,
+            .receive_window_bytes = rcv_wnd,
+            .manual_ceiling_available = ctx->host_rmem_max > 0,
+            .manual_ceiling_bytes = ctx->host_rmem_max > 0 ? (uint64_t)ctx->host_rmem_max : 0,
+            .autotune_ceiling_available = ctx->host_autotune_max > 0,
+            .autotune_ceiling_bytes = ctx->host_autotune_max > 0 ? (uint64_t)ctx->host_autotune_max : 0,
+#if defined(_WIN32)
+            .windows = true,
+#endif
+            .slow_connection_ramp = starving,
+            .socket_budget_available = avail_sock > 0,
+            .range_bytes = p->segment_size,
+            .available_socket_bytes = avail_sock,
+            .physical_connections = tcp_conns,
+        };
+        struct mp_curl_policy_decision wdec = mp_curl_window_candidate(&win);
+        if (wdec.eligible && (int64_t)wdec.requested_bytes > p->measured_receive_bytes) {
+            MP_INFO(p, "adopting measured SO_RCVBUF %" PRIu64 " bytes (rtt %.0f ms, conns %d)\n",
+                    wdec.requested_bytes, tcp_rtt_ms, tcp_conns);
+            p->measured_receive_bytes = (int64_t)wdec.requested_bytes;
+            p->pool_transition = true;
+            p->last_reason = wdec.reason;
+        }
     }
 }
 
@@ -3836,24 +4165,42 @@ static void fill_dynamic(struct priv *p)
         p->controller = fresh;
         reset_phase(p, mp_time_ns());
     }
+    int64_t now = mp_time_ns();
     if (p->startup) {
-        int64_t now = mp_time_ns();
         int64_t progress_ns = p->total_ordered != p->controller.last_ordered_bytes
             ? now : MPMAX(p->startup_ns, p->controller.prefix_progress_ns);
-        int desired = p->opts->fixed_requests;
-        if (!desired)
-            desired = mp_curl_controller_startup_requests(&p->controller,
-                p->opts->parallel_requests, p->ctx->media_bitrate, p->ttfb_ms, now,
-                now - p->startup_ns, now - progress_ns);
-        p->selected_requests = MPMIN(desired, p->opts->parallel_requests);
+        double tcp_rtt_ms = -1;
+        uint64_t rcv_wnd = 0;
+        inspect_tcp_sockets(p, &tcp_rtt_ms, &rcv_wnd, NULL);
+        // When a high-RTT path has not yet reported a kernel receive window
+        // (e.g. first RTT before sample_sockets), assume a conservative 256 KiB
+        // ceiling so startup opens enough parallel sockets immediately.
+        double eff_rtt_ms = effective_path_rtt_ms(tcp_rtt_ms, p->ttfb_ms);
+        uint64_t est_wnd = rcv_wnd > 0 ? rcv_wnd : (eff_rtt_ms >= 50 ? (256ULL << 10) : 0);
+        struct mp_curl_startup_input sin = {
+            .max_requests = p->opts->parallel_requests,
+            .fixed_requests = p->opts->fixed_requests,
+            .demand_bps = p->ctx->media_bitrate,
+            .rtt_ms = tcp_rtt_ms,
+            .ttfb_ms = p->ttfb_ms,
+            .receive_window_bytes = est_wnd,
+            .now_ns = now,
+            .startup_age_ns = now - p->startup_ns,
+            .prefix_wait_ns = now - progress_ns,
+            .seeking = p->ctx->playback_seeking,
+        };
+        p->selected_requests = mp_curl_controller_startup_requests(&p->controller, &sin);
         p->urgency = 1;
         if (p->ctx->stream_id == p->stream_id)
             p->ctx->selected_requests = p->selected_requests;
-        if (p->ctx->buffer_seconds >= .5 || now - p->startup_ns >= MP_TIME_S_TO_NS(1)) {
+        int64_t max_startup_ns = MPCLAMP(MP_TIME_MS_TO_NS(6 * MPMAX(50.0, eff_rtt_ms)),
+                                         MP_TIME_S_TO_NS(1), MP_TIME_S_TO_NS(2));
+        if (p->ctx->buffer_seconds >= .5 || now - p->startup_ns >= max_startup_ns) {
             p->startup = false;
             reset_phase(p, now);
         }
     }
+    evaluate_auto_transport(p, now);
     {
         mp_mutex_lock(&p->mtx);
         for (int n = p->range_count; n < p->num_ranges; n++) {
@@ -3868,7 +4215,8 @@ static void fill_dynamic(struct priv *p)
         }
         mp_mutex_unlock(&p->mtx);
     }
-    update_adaptation(p);
+    if (!p->startup)
+        update_adaptation(p);
     size_ranges(p);
     // Drain a configuration generation before beginning the next trial.
     // Otherwise a new request can contribute only half its time/body.
@@ -3953,7 +4301,7 @@ static bool retain_warm_request(struct dynamic_request *request)
     size_t remaining = request->length - request->fetch_pos;
     if (rtt <= 0 || capacity <= 0 || remaining > capacity * rtt)
         return false;
-    struct warm_request *warm = talloc_zero(p->ctx, struct warm_request);
+    struct warm_request *warm = talloc_zero(NULL, struct warm_request);
     if (!warm)
         return false;
     for (struct curl_slist *header = p->range_headers; header; header = header->next) {
@@ -4112,6 +4460,8 @@ static void start_dynamic(struct priv *p)
     p->queue_open = false;
     mp_mutex_unlock(&p->mtx);
     p->dynamic_started = true;
+    if (p->startup)
+        p->startup_ns = mp_time_ns();
     if (!prepare_range_headers(p)) {
         MP_WARN(p, "could not allocate parallel range headers\n");
         p->dynamic_supported = false;
@@ -4457,7 +4807,6 @@ static void setup_curl(struct priv *p, CURL *c)
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_MAXREDIRS, (long)p->opts->max_redirects);
     apply_http_policy(p, c);
-    curl_easy_setopt(c, CURLOPT_PIPEWAIT, 1L);
     // Alt-Svc is evidence, never permission for curl to silently upgrade.
     curl_easy_setopt(c, CURLOPT_ALTSVC_CTRL, 0L);
     curl_easy_setopt(c, CURLOPT_HSTS_CTRL, (long)CURLHSTS_ENABLE);
@@ -4714,6 +5063,10 @@ static void priv_destructor(void *ptr)
     if (p->headers)
         curl_slist_free_all(p->headers);
     unregister_curl_stream(p);
+    talloc_free(p->probe_mime_type);
+    talloc_free(p->probe_effective_url);
+    talloc_free(p->server_filename);
+    talloc_free(p->etag);
     mp_mutex_destroy(&p->mtx);
     mp_cond_destroy(&p->cond);
 }

@@ -446,11 +446,18 @@ int mpv_render_context_render(mpv_render_context *ctx, mpv_render_param *params)
     if (frame != &dummy)
         talloc_free(frame);
 
-    if (GET_MPV_RENDER_PARAM(params, MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
-                             int, 1))
-    {
+    bool wait_for_present = GET_MPV_RENDER_PARAM(
+        params, MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, int, 1);
+    bool publish = do_render && err == 0 && ctx->renderer->fns->publish_frame;
+    if (wait_for_present || publish) {
         mp_mutex_lock(&ctx->lock);
-        while (wait_present_count > ctx->present_count)
+        // The VO can be replaced while the lock is dropped for GPU work.
+        // Detach and attach both set need_update_external until the render
+        // thread starts the next frame, even if the VO address is reused.
+        if (publish && ctx->vo && !ctx->need_update_external &&
+            !ctx->need_reconfig && !ctx->need_reset)
+            ctx->renderer->fns->publish_frame(ctx->renderer, ctx->vo);
+        while (wait_for_present && wait_present_count > ctx->present_count)
             mp_cond_wait(&ctx->video_wait, &ctx->lock);
         mp_mutex_unlock(&ctx->lock);
     }
@@ -705,6 +712,10 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     mp_mutex_lock(&ctx->lock);
     forget_frames(ctx, true);
     ctx->img_params = *params;
+    mp_mutex_lock(&vo->params_mutex);
+    vo->target_params = NULL;
+    vo->has_peak_detect_values = false;
+    mp_mutex_unlock(&vo->params_mutex);
     ctx->need_reconfig = true;
     ctx->need_resize = true;
     mp_mutex_unlock(&ctx->lock);

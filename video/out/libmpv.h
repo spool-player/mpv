@@ -76,6 +76,9 @@ struct render_backend_fns {
     // Implementation of mpv_render_context_render().
     int (*render)(struct render_backend *ctx, mpv_render_param *params,
                   struct vo_frame *frame);
+    // Publish metadata from a completed frame while the caller holds the
+    // context lock and the associated VO is still live. Optional.
+    void (*publish_frame)(struct render_backend *ctx, struct vo *vo);
     // Free all data in ctx->priv.
     void (*destroy)(struct render_backend *ctx);
 };

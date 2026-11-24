@@ -78,7 +78,10 @@ struct priv {
     struct gpu_ctx *gpu_ctx;
     struct mppl_video *renderer;
     struct mp_hwdec_devices *hwdec_devs;
-    struct vo *vo;
+    bool has_vo;
+    struct mp_image_params rendered_target_params;
+    struct pl_hdr_metadata rendered_hdr;
+    bool rendered_hdr_valid;
     struct mp_image_params target_params;
 
     // OpenGL: the caller's GL context, and the swapchain over its framebuffer.
@@ -458,11 +461,6 @@ static void reconfig(struct render_backend *ctx, struct mp_image_params *params)
 {
     struct priv *p = ctx->priv;
     mppl_video_config(p->renderer, params);
-    if (p->vo) {
-        mp_mutex_lock(&p->vo->params_mutex);
-        p->vo->target_params = NULL;
-        mp_mutex_unlock(&p->vo->params_mutex);
-    }
 }
 
 static void reset(struct render_backend *ctx)
@@ -494,7 +492,7 @@ static struct mp_image *get_image(struct render_backend *ctx, int imgfmt,
 static void update_external(struct render_backend *ctx, struct vo *vo)
 {
     struct priv *p = ctx->priv;
-    p->vo = vo;
+    p->has_vo = vo != NULL;
     mppl_video_set_osd_source(p->renderer, vo ? vo->osd : NULL);
     if (vo) {
         mppl_video_reload_options(p->renderer);
@@ -575,7 +573,7 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
                   struct vo_frame *frame)
 {
     struct priv *p = ctx->priv;
-    if (!p->vo)
+    if (!p->has_vo)
         return MPV_ERROR_UNINITIALIZED;
 
     mppl_video_begin_frame(p->renderer, frame, (struct pl_color_space){0}, 0);
@@ -654,16 +652,24 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
         ok = false;
 
     if (ok) {
-        mp_mutex_lock(&p->vo->params_mutex);
-        p->target_params = target_params;
-        p->vo->target_params = &p->target_params;
-        if (p->vo->params) {
-            p->vo->has_peak_detect_values =
-                mppl_video_get_hdr_metadata(p->renderer, &p->vo->params->color.hdr);
-        }
-        mp_mutex_unlock(&p->vo->params_mutex);
+        p->rendered_target_params = target_params;
+        p->rendered_hdr_valid = mppl_video_get_hdr_metadata(p->renderer, &p->rendered_hdr);
     }
     return ok ? 0 : MPV_ERROR_GENERIC;
+}
+
+static void publish_frame(struct render_backend *ctx, struct vo *vo)
+{
+    struct priv *p = ctx->priv;
+    mp_mutex_lock(&vo->params_mutex);
+    p->target_params = p->rendered_target_params;
+    vo->target_params = &p->target_params;
+    if (vo->params) {
+        vo->has_peak_detect_values = p->rendered_hdr_valid;
+        if (p->rendered_hdr_valid)
+            vo->params->color.hdr = p->rendered_hdr;
+    }
+    mp_mutex_unlock(&vo->params_mutex);
 }
 
 const struct render_backend_fns render_backend_gpu_next = {
@@ -680,6 +686,7 @@ const struct render_backend_fns render_backend_gpu_next = {
     .resize = resize,
     .get_target_size = get_target_size,
     .render = render,
+    .publish_frame = publish_frame,
     .destroy = destroy,
 };
 

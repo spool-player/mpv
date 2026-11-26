@@ -108,6 +108,11 @@ test('libmpv-test-seek-restart', seek_restart,
      args: seek_restart_sample.full_path(), depends: seek_restart_sample,
      suite: 'libmpv')
 
+render_timeout = executable('libmpv-test-render-timeout', '../libmpv_render_timeout.c',
+                            include_directories: incdir, dependencies: libmpv_dep)
+test('libmpv-test-render-timeout', render_timeout,
+     args: video.full_path(), depends: video, suite: 'libmpv')
+
 
 sdh_default = join_paths(source_root, 'test', 'samples', 'sdh_default.srt')
 sdh_mixed = join_paths(source_root, 'test', 'samples', 'sdh_mixed.srt')

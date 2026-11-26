@@ -91,6 +91,7 @@ struct mpv_render_context {
     bool redrawing;                 // next_frame was a redraw request
     int64_t flip_count;
     struct vo_frame *cur_frame;
+    bool cur_frame_needs_render;
     struct mp_image_params img_params;
     int vp_w, vp_h;
     bool flip;
@@ -166,6 +167,7 @@ void *get_mpv_render_param(mpv_render_param *params, mpv_render_param_type type,
 static void forget_frames(struct mpv_render_context *ctx, bool all)
 {
     mp_cond_broadcast(&ctx->video_wait);
+    ctx->cur_frame_needs_render = false;
     if (all) {
         talloc_free(ctx->cur_frame);
         ctx->cur_frame = NULL;
@@ -416,6 +418,7 @@ int mpv_render_context_render(mpv_render_context *ctx, mpv_render_param *params)
     ctx->need_reset = false;
 
     struct vo_frame *frame = ctx->next_frame;
+    ctx->cur_frame_needs_render = false;
     int64_t wait_present_count = ctx->present_count;
     if (frame) {
         ctx->next_frame = NULL;
@@ -482,7 +485,7 @@ uint64_t mpv_render_context_update(mpv_render_context *ctx)
     mp_dispatch_queue_process(ctx->dispatch, 0);
 
     mp_mutex_lock(&ctx->lock);
-    if (ctx->next_frame)
+    if (ctx->next_frame || ctx->cur_frame_needs_render)
         res |= MPV_RENDER_UPDATE_FRAME;
     mp_mutex_unlock(&ctx->lock);
     return res;
@@ -513,6 +516,8 @@ int mpv_render_context_get_info(mpv_render_context *ctx,
                 (frame->display_synced && !frame->redraw ?
                     MPV_RENDER_FRAME_INFO_BLOCK_VSYNC : 0);
             info->target_time = frame->pts;
+        } else if (ctx->cur_frame_needs_render) {
+            info->flags = MPV_RENDER_FRAME_INFO_PRESENT | MPV_RENDER_FRAME_INFO_REDRAW;
         }
         res = 0;
         break;
@@ -545,6 +550,7 @@ static void flip_page(struct vo *vo)
     struct vo_priv *p = vo->priv;
     struct mpv_render_context *ctx = p->ctx;
     int64_t until = mp_time_ns() + MP_TIME_MS_TO_NS(200);
+    bool request_redraw = false;
 
     mp_mutex_lock(&ctx->lock);
 
@@ -585,12 +591,18 @@ done:
         talloc_free(ctx->cur_frame);
         ctx->cur_frame = ctx->next_frame;
         ctx->next_frame = NULL;
+        // The frame missed presentation, but the API can still redraw it.
+        // Paused playback may never queue another frame to wake the renderer.
+        ctx->cur_frame_needs_render = true;
+        request_redraw = true;
         ctx->present_count += 2;
         mp_cond_signal(&ctx->video_wait);
         vo_increment_drop_count(vo, 1);
     }
 
     mp_mutex_unlock(&ctx->lock);
+    if (request_redraw)
+        update(ctx);
 }
 
 static int query_format(struct vo *vo, int format)
